@@ -1,0 +1,27 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zipapp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: zipapp
+  template:
+    metadata:
+      labels:
+        app: zipapp
+    spec:
+      containers:
+      - name: zipapp
+        image: zipapp:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 4000
+        securityContext:
+          seccompProfile:
+            type: Localhost
+            localhostProfile: seccomp-profile.json
+          privileged: true
+          capabilities:
+            add: ["SYS_ADMIN"]

@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: falco-handler
+  labels:
+    app: falco-handler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: falco-handler
+  template:
+    metadata:
+      labels:
+        app: falco-handler
+    spec:
+      serviceAccountName: falco-handler
+      containers:
+        - name: falco-handler
+          image: falco-handler:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5000
