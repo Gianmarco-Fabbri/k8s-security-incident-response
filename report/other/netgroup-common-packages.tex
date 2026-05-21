@@ -1,0 +1,58 @@
+%Common packages used in the netgroup-didattica template
+
+% Loads English-specific settings (e.g., hypernation,  etc.)
+\usepackage[english]{babel}
+
+% Supports Italian special characters (e.g., accents, etc.)
+\usepackage[latin1]{inputenc}
+
+% This shows captions as "Figure X.Y: Bla bla bla"
+\usepackage[font=small, labelformat=simple]{caption}
+% This shows captions as "Bla bla bla"
+%\usepackage[font=small, labelformat=empty]{caption}
+
+% Package introducing typographic refinements
+\usepackage{microtype}
+
+% Packages that have to be used for fancy tables
+\usepackage[table]{xcolor}
+\usepackage{array}
+\usepackage{color}
+\usepackage{colortbl}
+
+\usepackage{ifthen}
+\usepackage{longtable}
+
+% Packages that have to be used to type units of measurements
+\usepackage{textcomp}
+\usepackage{siunitx}
+\sisetup{
+	detect-family=true,
+	detect-weight=true,
+}
+\DeclareSIUnit\byte{B}
+
+% Package that creates "clickable" links. It needs to be loaded before cleveref.
+\usepackage[pdftex]{hyperref}
+\hypersetup{
+    colorlinks=true,
+    allcolors=blue
+}
+
+% Package that provides "smart" references.
+\usepackage{amsmath}
+\usepackage[capitalise,nameinlink,noabbrev]{cleveref}
+
+% Show blank lines across all the width of the page
+\newenvironment{rules}[1][1]
+{\flushleft\minipage{\textwidth}
+	\linespread{#1}\selectfont
+	\def\\{\begingroup\leavevmode\parfillskip=0pt
+		\hrulefill\endgraf\endgroup}}
+{\endminipage\endflushleft}
+
+
+% extra:
+\usepackage[most]{tcolorbox}
+
+\usepackage{subfiles}

@@ -1,0 +1,56 @@
+\PassOptionsToPackage{hyphens}{url}
+\documentclass[exercise]{other/netgroup_didattica}
+% Include most common packages and macros that are needed in all files
+\input{other/netgroup-common-packages.tex}
+% Include the packages and macros that are required to include code listings
+\input{other/netgroup-code-listings.tex}
+
+% Set the listings style to be used globally
+\lstset{style=bash}
+
+\def\thetitle{Runtime Security Monitoring in Kubernetes}
+\def\theauthor{\parbox{\linewidth}{\centering Gianmarco Fabbri \\ S361504}}
+
+\title{\thetitle}
+\course{\parbox{\linewidth}{\centering Networks \& Cloud Technologies and Security \\ Network and Cloud Security}}
+\author{\theauthor}
+\logo{images/logo.jpg}
+
+% Customize the metadata inside the output PDF file
+\hypersetup{
+    pdftitle={\thetitle},
+    %pdfauthor={\theauthor},
+}
+
+% Create index
+\makeindex
+
+\begin{document}
+
+\maketitle
+
+\pagebreak
+
+% Standard license for Netgroup exercises
+\input{other/netgroup-license.tex}
+
+\section*{Acknowledgments}
+%The author would like to thank all the people who contributed to this document, particularly Francesco Pizzato, who created the first version of this lab, and Alex Palesandro, Marco Iorio, and Stefano Galantino for their valuable enhancements and subsequent improvements.
+
+\clearpage
+
+\setcounter{tocdepth}{1} 
+\tableofcontents
+\pagebreak
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subfile{src/ch1}
+\subfile{src/ch2}
+\subfile{src/ch3}
+\subfile{src/ch4}
+\subfile{src/ch5}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+% ------------------------------------------------------- %
+\end{document}

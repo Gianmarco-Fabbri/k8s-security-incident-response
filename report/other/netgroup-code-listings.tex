@@ -1,0 +1,93 @@
+% Commands needed to show code on Netgroup documents
+
+\usepackage{embedfile}
+\usepackage{courier}
+\usepackage{listings}
+
+\lstset{
+	basicstyle=\ttfamily\footnotesize,
+	keywordstyle=\ttfamily,
+	stepnumber=1,
+	showstringspaces=false,
+	tabsize=4,
+	breaklines=true,
+	breakatwhitespace=false,
+	aboveskip=1.25\medskipamount,
+	belowskip=0.5\medskipamount,
+	upquote=true,
+	captionpos=b,
+    frame=single, % draw a frame around the code block
+    framesep=5pt,
+    framexleftmargin=5pt,
+    framexrightmargin=5pt,
+    xleftmargin=10pt,
+    xrightmargin=10pt,
+}
+
+% Settings specific for bash
+\lstdefinestyle{bash}{
+	language=bash
+}
+
+% Settings specific for c and c++
+\lstdefinestyle{c++}{
+	language=c++,
+	alsolanguage=c,
+	commentstyle=\color{gray}, % comment color
+    keywordstyle=\color{blue}, % keyword color
+    stringstyle=\color{red},  % literal strings color
+}
+
+% Alternative settings for c and c++
+\lstdefinestyle{c-alt}{
+	language=c++,
+	commentstyle=\color{gray}, % comment color
+	commentstyle=\color{gray}, % comment color
+    keywordstyle=\textbf, % keyword color
+}
+
+% Settings specific for python
+\lstdefinestyle{python}{
+	language=python,
+	commentstyle=\color{gray}, % comment color
+    keywordstyle=\textbf, % keyword color
+}
+
+% Position the caption to the right (requires the caption package to be loaded)
+%\captionsetup[lstlisting]{singlelinecheck=false, justification=raggedleft}
+
+% This command prints a listing and embeds it at the same time as a PDF attachment
+% so that it can be retrieved without the spacing issues introduced by the PDF format.
+% Optional arguments between brackets are passed directly to \lstinputlisting
+
+% Due to a bug in the listings and/or caption packages, the caption below a
+% listing is erroneously positioned too far to the left if within an
+% enumerate or itemize environment. The modified version below applies a
+% margin to correct the problem (may need to be tuned to handle more cases).
+
+% Bug references: (as of Nov. 2019 no fix seems to be available)
+% https://tex.stackexchange.com/questions/442725/listings-caption-alignment-in-list-environments
+% https://gitlab.com/axelsommerfeldt/caption/issues/26
+% \newcommand{\embedsnippet}[2][]{%
+%	\embedfile{#2}%
+%	\lstinputlisting[title={This code snipped is attached to the PDF file as ``\lstinline{#2}''},#1]{#2}%
+% }
+
+\makeatletter
+\newcommand{\embedsnippet}[2][]{%
+	% Embed the listing
+	\embedfile{#2}%
+	% Set a negative margin if within an enumerate environment
+	\def\@tempa{enumerate}
+	\ifx\@currenvir\@tempa
+    		\captionsetup[lstlisting]{margin={0pt,-\leftmargin}}%
+  	\fi
+	% Set a negative margin if within an itemize environment
+	\def\@tempb{itemize}
+	\ifx\@currenvir\@tempb
+    		\captionsetup[lstlisting]{margin={0pt,-\leftmargin}}%
+  	\fi
+	% Print the listing
+	\lstinputlisting[title={\emph{This code snipped is attached to the PDF file as ``\lstinline{#2}''}},#1]{#2}%
+}
+\makeatother
