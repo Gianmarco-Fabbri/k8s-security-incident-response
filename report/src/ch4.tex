@@ -1,50 +1,42 @@
-\chapter{Automated Alert Response with Falco Handler}
+\chapter{Alert response using Falco Handler}
+\label{ch:ch4}
 
-Detecting an attack in real time is only half the battle. The other half is \textbf{responding} to it. Falco, by itself, is a pure detection engine -- it generates alerts but does not take any automatic action on the cluster. In production environments, security teams integrate Falco with an \textbf{automated response system} to minimize the window between detection and remediation.
+Detecting an attack in real time is only half the battle. The other half is \textbf{responding} to it. Falco, by itself, is a pure detection engine --- it generates alerts but does not take any automatic action on the cluster. In production environments, security teams integrate Falco with an \textbf{automated response system} to minimize the window between detection and remediation.
 
 In this chapter, we will extend our Falco deployment with two additional components:
 \begin{itemize}
     \item \textbf{Falcosidekick}: a companion service that receives alerts from Falco via an internal channel and fans them out to external destinations such as webhooks, Slack, PagerDuty, or S3.
-    \item \textbf{Falco Handler}: a custom Python microservice deployed in the cluster that receives Falco alerts via webhook and executes an automated response -- in our case, labeling the compromised deployment with \texttt{tainted-by-falco=true}.
+    \item \textbf{Falco Handler}: a custom Python microservice deployed in the cluster that receives Falco alerts via webhook and executes an automated response --- in our case, mutating the compromised pod's labels to gracefully isolate it.
 \end{itemize}
 
-\begin{tcolorbox}[colback=blue!5!white,colframe=blue!75!black,title=Detection vs. Response]
-The pipeline we are building implements the two phases of an Incident Response cycle:
-\begin{itemize}
-    \item \textbf{Detection (Falco)}: observes kernel-level events and generates structured alerts.
-    \item \textbf{Response (Handler)}: consumes those alerts and triggers an action. The action in this lab is labeling the deployment, but the same architecture can be used to isolate a pod by scaling it to zero replicas, rotate credentials, or trigger a Slack notification.
-\end{itemize}
-\end{tcolorbox}
-
-\section{Architecture Overview}
+\section{Architecture overview}
 
 The full alert pipeline works as follows:
 
 \begin{enumerate}
     \item Falco intercepts a suspicious syscall and generates a JSON alert.
-    \item The alert is sent over an internal HTTP channel to \textbf{Falcosidekick}, which runs as a sidecar container in the same Falco pod.
+    \item The alert is sent over an internal HTTP channel to \textbf{Falcosidekick}, which is deployed as a standalone Pod in the same namespace.
     \item Falcosidekick forwards the alert as an HTTP POST request to the \textbf{Falco Handler} service endpoint.
-    \item The Handler extracts the pod name and namespace from the JSON payload, resolves the parent deployment, and labels it.
+    \item The Handler extracts the pod name and namespace from the JSON payload, and patches the pod directly to quarantine it.
 \end{enumerate}
 
-\section{Deploying the Falco Handler}
+\section{Deploying the Falco handler}
 
 \subsection{The Handler Microservice}
 
-The handler is a minimal Python Flask application. It exposes a single \texttt{POST /} endpoint that receives the JSON alert from Falcosidekick, identifies the affected Kubernetes deployment, and applies a label to it.
+The handler is a minimal Python Flask application. It exposes a single \texttt{POST /} endpoint that receives the JSON alert from Falcosidekick, identifies the affected Kubernetes pod, and applies a label to it.
 
-The handler requires \textbf{RBAC permissions} to interact with the Kubernetes API. We must create a dedicated ServiceAccount, a ClusterRole granting read access to pods and patch access to deployments, and bind them together.
-
-\begin{tcolorbox}[colback=blue!5!white,colframe=blue!75!black,title=Info]
-The handler image and all necessary Kubernetes manifests (\texttt{falco-handler-rbac.yaml}, \texttt{falco-handler-deployment.yaml}, \texttt{falco-handler-service.yaml}) are included in the \texttt{material/falco\_handler} directory.
-\end{tcolorbox}
+The handler requires \textbf{RBAC permissions} to interact with the Kubernetes API. We must create a dedicated ServiceAccount, a ClusterRole granting read and patch access to pods, and bind them together.
 
 \subsection{Deploying the Handler}
 
-Navigate to the handler's manifests directory and apply the resources in the \texttt{default} namespace:
+Navigate to the handler's directory to build its Docker image and apply the resources in the \texttt{default} namespace:
 
 \begin{lstlisting}[language=bash]
-cd ../falco_handler
+cd $HOME/material/falco_handler/src
+docker build -t falco-handler:latest .
+docker save falco-handler:latest | sudo ctr -n k8s.io images import -
+cd ..
 kubectl apply -f falco-handler-rbac.yaml
 kubectl apply -f falco-handler-deployment.yaml
 kubectl apply -f falco-handler-service.yaml
@@ -67,7 +59,7 @@ We now need to upgrade our Falco Helm release to enable Falcosidekick and point 
 
 Create a file \texttt{falco-sidekick-values.yaml}:
 
-\begin{lstlisting}[language={}]
+\begin{lstlisting}[language=bash]
 cat <<EOF > falco-sidekick-values.yaml
 falcosidekick:
   enabled: true
@@ -93,54 +85,96 @@ Wait for the pods to restart:
 kubectl rollout status daemonset/falco -n falco
 \end{lstlisting}
 
-After the rollout, each Falco pod will now have two containers: \texttt{falco} and \texttt{falcosidekick}.
+After the rollout, a new dedicated Deployment for Falcosidekick will be spun up alongside the existing Falco DaemonSet. (Note: the Falco pods themselves show \texttt{2/2} containers because they run the core engine and a sidecar for rules updates, but Falcosidekick runs independently).
 
 \begin{lstlisting}[language=bash]
 kubectl get pods -n falco
 \end{lstlisting}
 
 \begin{lstlisting}[language=bash]
-NAME          READY   STATUS    RESTARTS   AGE
-falco-4dgzk   2/2     Running   0          45s
+NAME                                   READY   STATUS    RESTARTS   AGE
+falco-4dgzk                            2/2     Running   0          45s
+falco-falcosidekick-5c68f9b7c8-xk2mp   1/1     Running   0          10s
 \end{lstlisting}
 
-\section{Observing the Automated Response}
+\section{Observing the automated response}
 
-Trigger any of the attacks from Chapter~3 (e.g., upload the \texttt{ptrace\_payload.zip} or run the reverse shell). After the attack, check the handler logs:
+Trigger any of the attacks from Chapter~\ref{ch:ch3} (e.g., run the reverse shell exploit or copy and execute the \texttt{ptrace} binary). After the attack, check the handler logs:
 
 \begin{lstlisting}[language=bash]
 kubectl logs deployment/falco-handler
 \end{lstlisting}
 
-You should see output similar to the following, showing that the handler received the alert, resolved the deployment name, and applied the label:
+You should see output similar to the following, showing that the handler received the alert, and applied the label to the pod:
 
 \begin{lstlisting}[language=bash]
-[*] Triggered rule from pod=zipapp-5ffd444d74-jbwq2, ns=default
-[*] Deployment: zipapp
-[+] Labeled deployment zipapp in default
+[*] Triggered rule from pod=vulnapp-7c4d9f8b4-xk2mp, ns=default
+[+] Quarantined pod vulnapp-7c4d9f8b4-xk2mp in default
 \end{lstlisting}
 
-Now verify that the label was applied to the deployment:
+Now verify that the label was applied to the pod:
 
 \begin{lstlisting}[language=bash]
-kubectl get deployments --show-labels
+kubectl get pods --show-labels
 \end{lstlisting}
 
 \begin{lstlisting}[language=bash]
-NAME     READY   UP-TO-DATE   AVAILABLE   LABELS
-zipapp   1/1     1            1           app=zipapp,tainted-by-falco=true
+NAME                       READY   STATUS    RESTARTS   AGE   LABELS
+vulnapp-7c4d9f8b4-xk2mp   1/1     Running   0          45m   tainted-by-falco=true
+vulnapp-7c4d9f8b4-zt5q8   1/1     Running   0          10s   app=vulnapp,pod-template-hash=7c4d9f8b4
 \end{lstlisting}
 
-The label \texttt{tainted-by-falco=true} marks the deployment as compromised. This label can be used by other systems to trigger further remediation actions.
+The label \texttt{tainted-by-falco=true} marks the pod as compromised. Notice that all other labels (including the \texttt{app} selector) were dynamically stripped by the handler. This elegantly detaches the pod from the ReplicaSet (triggering the creation of a healthy replacement pod to serve users) while keeping the compromised pod alive for forensics. Furthermore, if another attack occurs, the handler will automatically delete the old quarantined pod before isolating the new one, strictly limiting the namespace to exactly 1 quarantined pod to prevent resource exhaustion Denial of Service (DoS) attacks. 
 
-\begin{tcolorbox}[colback=green!5!white,colframe=green!75!black,title=Question]
-\begin{itemize}
-    \item The current handler only applies a label. Look at the commented-out code block in the handler: what more aggressive action was planned but left disabled? When would it be appropriate to enable it?
-    \item The handler uses a \texttt{ClusterRole} (cluster-wide permissions) rather than a \texttt{Role} (namespace-scoped). Why is this necessary given how the handler resolves the pod's deployment?
-    \item After the attack, remove the label from the deployment manually:
-\end{itemize}
+\textbf{Note on Architecture}: To enforce this 1-pod limit safely, the handler's Gunicorn server is deliberately configured with a single worker thread, and the Kubernetes Deployment is strictly bound to \texttt{replicas: 1}. It is critical that this Deployment is never auto-scaled (e.g., via a Horizontal Pod Autoscaler). In a highly concurrent or multi-replica scenario (a burst attack), multiple threads or pods querying the Kubernetes API simultaneously would be subject to a Time-of-Check to Time-of-Use (TOCTOU) race condition, potentially bypassing the limit. Rather than introducing complex distributed locking mechanisms like Kubernetes Leases, restricting concurrency and scale is a secure and simple architectural choice for this environment. 
+
+While labeling is useful, to achieve a true closed-loop response, we need to act upon this label. Since we have Cilium installed, we can enforce a \textbf{CiliumNetworkPolicy} that automatically isolates any pod bearing this label.
+
+\subsection{Enforcing Network Isolation}
+
+Let's apply a policy that selects endpoints with the tainted label and enforces empty ingress and egress rules, effectively dropping all network traffic:
+
 \begin{lstlisting}[language=bash]
-kubectl label deployment zipapp tainted-by-falco-
+kubectl apply -f ../manifests/isolate-tainted-policy.yaml
 \end{lstlisting}
-\end{tcolorbox}
 
+Now, if you try to execute a reverse shell or ping an external server from the compromised pod, the traffic will be dropped instantly. The Falco Handler applied the label upon detection, which immediately triggered the Cilium network isolation.
+
+You can verify the isolation by trying to ping an external server from the compromised pod:
+
+\begin{lstlisting}[language=bash]
+kubectl exec $POD -- ping -c 3 8.8.8.8
+\end{lstlisting}
+
+The command will fail, demonstrating that the threat has been successfully contained without human intervention.
+
+After the exercise, you can safely delete the quarantined pod:
+
+\begin{lstlisting}[language=bash]
+kubectl delete pod $POD
+\end{lstlisting}
+
+\section{Clean up}
+
+Once you have finished the lab, clean up all resources:
+
+\begin{lstlisting}[language=bash]
+# Remove the Falco handler
+kubectl delete deployment falco-handler
+kubectl delete service falco-handler
+kubectl delete clusterrolebinding falco-handler-pod-binding
+kubectl delete clusterrole falco-pod-manager
+kubectl delete serviceaccount falco-handler
+
+# Remove the Cilium Network Policy
+kubectl delete -f ../manifests/isolate-tainted-policy.yaml --ignore-not-found
+
+# Remove the application and attacker pod
+kubectl delete deployment vulnapp
+kubectl delete service vulnapp
+kubectl delete pod attacker --ignore-not-found
+
+# Remove Falco
+helm uninstall falco -n falco
+kubectl delete namespace falco
+\end{lstlisting}

