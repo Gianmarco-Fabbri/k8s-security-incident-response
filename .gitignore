@@ -1,20 +1,44 @@
-# LaTeX temporary files
+# OS specific files
+.DS_Store
+**/.DS_Store
+Thumbs.db
+ehthumbs.db
+
+# LaTeX temporary build files
 *.aux
 *.log
 *.toc
 *.out
+*.idx
+*.ilg
+*.ind
 *.synctex.gz
 *.fls
 *.fdb_latexmk
+*.bbl
+*.blg
+*.bcf
+*.run.xml
 *.pdf.bak
 
 # Python temporary files
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
 .pytest_cache/
 
-# OS specific files
-.DS_Store
-Thumbs.db
+# Compiled native binaries
+material/payloads/ptrace
+*.o
+*.a
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+*~
