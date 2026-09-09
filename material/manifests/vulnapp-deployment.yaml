@@ -1,0 +1,20 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vulnapp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vulnapp
+  template:
+    metadata:
+      labels:
+        app: vulnapp
+    spec:
+      containers:
+      - name: vulnapp
+        image: vulnapp:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8080
