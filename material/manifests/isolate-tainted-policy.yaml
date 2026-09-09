@@ -1,0 +1,10 @@
+apiVersion: "cilium.io/v2"
+kind: CiliumNetworkPolicy
+metadata:
+  name: isolate-tainted-pods
+spec:
+  endpointSelector:
+    matchLabels:
+      tainted-by-falco: "true"
+  ingress: []
+  egress: []
