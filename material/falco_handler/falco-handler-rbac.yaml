@@ -7,27 +7,21 @@ metadata:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: falco-deployment-manager
+  name: falco-pod-manager
 rules:
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list"]
-  - apiGroups: ["apps"]
-    resources: ["deployments", "replicasets"]
-    verbs: ["get", "list", "patch"]
-  - apiGroups: ["apps"]
-    resources: ["deployments/scale"]
-    verbs: ["get", "update", "patch"]
+    verbs: ["get", "list", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: falco-handler-deployment-binding
+  name: falco-handler-pod-binding
 subjects:
   - kind: ServiceAccount
     name: falco-handler
     namespace: default
 roleRef:
   kind: ClusterRole
-  name: falco-deployment-manager
+  name: falco-pod-manager
   apiGroup: rbac.authorization.k8s.io

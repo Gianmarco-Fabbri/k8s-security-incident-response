@@ -1,17 +1,20 @@
-FROM debian:bullseye-slim
+FROM python:3.11-slim
+
+# Create a non-root user
+RUN useradd -m -s /bin/bash appuser
 
 WORKDIR /app
 
 COPY handler.py .
 
+# Install dependencies without curl
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        python3 python3-pip \
-        curl && \
-    pip3 install flask && \
+    pip install --no-cache-dir flask kubernetes gunicorn && \
     apt-get clean && \
-    rm -rf /var/lib/apt/lists/* \
-    && curl -SLo /usr/local/bin/kubectl https://storage.googleapis.com/kubernetes-release/release/$(curl -S https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl \
-    && chmod +x /usr/local/bin/kubectl
+    rm -rf /var/lib/apt/lists/*
 
-CMD ["python3", "-u", "handler.py"]
+# Switch to non-root user
+USER appuser
+
+# Run with Gunicorn instead of Flask's built-in server
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--access-logfile", "-", "--error-logfile", "-", "handler:app"]
