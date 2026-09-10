@@ -5,7 +5,6 @@
 [![Cilium](https://img.shields.io/badge/Cilium-eBPF%20v1.15.14-F05A24?logo=cilium&logoColor=white)](https://cilium.io/)
 [![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Academic Project](https://img.shields.io/badge/Evaluation-31%2F30%20Cum%20Laude-brightgreen.svg)]()
 
 An enterprise-grade, closed-loop runtime threat detection, forensic isolation, and automated self-healing architecture for Kubernetes workloads, powered by **Falco**, **Falcosidekick**, and **Cilium eBPF**.
 
