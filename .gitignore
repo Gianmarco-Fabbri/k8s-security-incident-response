@@ -42,3 +42,6 @@ material/payloads/ptrace
 .idea/
 *.swp
 *~
+
+# Documentation
+docs/

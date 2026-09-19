@@ -1,4 +1,4 @@
-\chapter{Initial setup}
+\chapter{Historical CrownLabs setup}
 \label{ch:ch2}
 
 The physical setup of this lab consists of a single VM representing our bare-metal infrastructure. This VM will act as an all-in-one Kubernetes \textit{control plane} and \textit{worker node} (Single-Node architecture). This topology is specifically chosen to bypass VXLAN overlay network restrictions present in the CrownLabs environment that drop cross-node pod traffic. The installation process requires the \texttt{kubeadm}, \texttt{kubectl}, and \texttt{kubelet} packages to be installed: the provided CrownLabs image already includes them.
@@ -77,10 +77,13 @@ Now that you have a fully working Kubernetes cluster, we can proceed to deploy t
 
 We will use \texttt{vulnapp}: a minimal Python web application that simulates a network diagnostic tool. It exposes a form where the user enters a hostname or IP address and the server executes a \texttt{ping} against it. The application is intentionally vulnerable to \textbf{Command Injection} due to the use of unsanitized user input in a shell command --- a deliberate design choice to simulate one of the most common classes of real-world web vulnerabilities (OWASP Top~10 A03: Injection). You will explore this vulnerability in depth in Chapter~\ref{ch:ch3}.
 
-The instructor has provided a ZIP archive containing all the necessary materials for this lab (manifests, payloads, and application source). Extract the archive:
+The original teaching distribution used a ZIP archive. In the public repository,
+use the checked-out \texttt{material/} directory instead; no \texttt{material.zip}
+is distributed. The paths below describe the historical VM layout, not an additional
+archive to download:
 
 \begin{lstlisting}[language=bash]
-unzip material.zip
+# Use the material/ directory from the repository checkout.
 \end{lstlisting}
 
 The \texttt{vulnapp} Docker image must be built locally on the \textbf{control plane node}, where it will be scheduled to run. Navigate to the folder and build the image:
@@ -100,6 +103,7 @@ Return to the control plane node and deploy the application in the \texttt{defau
 \begin{lstlisting}[language=bash]
 kubectl apply -f $HOME/material/manifests/vulnapp-deployment.yaml
 kubectl apply -f $HOME/material/manifests/vulnapp-service.yaml
+kubectl apply -f $HOME/material/manifests/vulnapp-pdb.yaml
 \end{lstlisting}
 
 Verify that the application is running:
@@ -108,10 +112,13 @@ Verify that the application is running:
 kubectl get pods
 \end{lstlisting}
 
-The output should show the \texttt{vulnapp} pod in the \texttt{Running} state:
+The output should show both \texttt{vulnapp} replicas in the \texttt{Running} state.
+The second replica reduces disruption during a single incident but does not guarantee
+continuous availability. The following is illustrative output:
 \begin{lstlisting}[language=bash]
 NAME                       READY   STATUS    RESTARTS   AGE
 vulnapp-7c4d9f8b4-xk2mp   1/1     Running   0          45s
+vulnapp-7c4d9f8b4-zt5q8   1/1     Running   0          43s
 \end{lstlisting}
 
 

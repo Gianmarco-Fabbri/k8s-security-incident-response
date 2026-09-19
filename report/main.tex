@@ -43,6 +43,21 @@ The author would like to thank all the people who contributed to this document, 
 \tableofcontents
 \pagebreak
 
+\section*{Revision status and reproducibility}
+This handbook builds on the university lab presented on 9 September 2026, before
+the afternoon repository changes (Git reference \texttt{9ec6471}). The original
+teaching material and its acknowledgments remain attributed to their authors.
+The current repository extends that lab; it is not the original submitted version.
+
+The CrownLabs setup in Chapter 2 documents the historical environment. For the
+current operational procedure, use the repository README, including its validation
+section: it specifies the chart version, authentication,
+network policies and migration checks. Do not combine the historical kernel-module
+installation with the current modern-eBPF configuration. Examples in this handbook
+are illustrative, not measurements of the current revision. Live Cilium enforcement
+has not been validated in the available OrbStack environment.
+\clearpage
+
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 \subfile{src/ch1}
 \subfile{src/ch2}
