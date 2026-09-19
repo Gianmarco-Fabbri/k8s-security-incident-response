@@ -1,4 +1,4 @@
-\chapter{Authenticated response and containment}
+\chapter{Incident response and validation}
 \label{ch:ch4}
 
 The current response prototype receives Falco syscall events through Falcosidekick
@@ -11,8 +11,8 @@ durable event delivery or a production controller.
 
 Use the repository README from the repository root. It pins Falco chart 9.1.0,
 uses modern eBPF (requiring kernel BTF), creates the authentication Secret and applies
-the Cilium isolation policy before enabling automatic response. The historical kmod
-installation in Chapter 2 is not the current supported quickstart.
+the Cilium isolation policy before enabling automatic response. Chapter~\ref{ch:ch2}
+describes the same deployment sequence and its environment requirements.
 
 The handler Service listens on port 80 and forwards to container port 5000.
 The Deployment uses a non-root user, read-only root filesystem, dropped capabilities,
@@ -87,12 +87,25 @@ OOM and node failures can still destroy volatile state.
 
 \section{Validation and safe cleanup}
 
-Unit tests and Docker checks are recorded separately from live-network checks in
-the README validation section. No end-to-end Cilium result is asserted for the current OrbStack
-environment. Sample logs elsewhere in this guide are illustrative historical examples.
+The following checks were completed for the current implementation:
+\begin{itemize}
+\item Sixteen handler regression tests passed in a hardened Python 3.11 container,
+running non-root with a read-only filesystem and no network access.
+\item Both container images built successfully; the target form and a loopback ping
+request passed a basic smoke test.
+\item Helm chart 9.1.0 rendered successfully; the webhook header and policy-selector
+labels were checked in the generated resources.
+\item Standard Kubernetes manifests passed server-side dry-run on Kubernetes
+v1.35.6+orb1, without creating deployment resources.
+\end{itemize}
+These checks do not validate the Cilium custom resource or live packet enforcement.
+End-to-end testing must additionally verify real Falco event identity, unauthorized
+sender rejection, Service detachment, replacement readiness, bidirectional network
+deny and behaviour under retries or bursts. Measure service errors and latency rather
+than asserting zero downtime. The repository README contains the integration checklist.
 
 Before cleanup, list quarantined pods, collect required evidence, and delete explicitly
 identified compromised pods. Do not remove the isolation policy while compromised
 pods remain running. Detached pods may outlive their Deployment; deleting the
-Deployment alone is not a complete cleanup. Remove only lab-owned resources and
+Deployment alone is not a complete cleanup. Remove only project-owned resources and
 verify the selected Kubernetes context before executing destructive commands.

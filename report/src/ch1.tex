@@ -1,17 +1,56 @@
-\chapter{Introduction}
+\chapter{Project overview}
 \label{ch:ch1}
+\section{Problem and objective}
+A compromised container can execute unexpected processes, open outbound connections
+or access credentials available to its workload. Detecting that behaviour is only
+one part of the response: deleting the pod immediately can interrupt service and
+destroy volatile evidence, while leaving it connected permits further activity.
 
-In recent years, the adoption of Kubernetes and container technologies has surged due to their versatility and scalability for the deployment of massive and highly-available distributed applications. Securing these complex environments at various levels is imperative. In this lab, we delve into the critical issue of runtime security monitoring, exploring solutions for securing Kubernetes clusters and enforcing threat detection mechanisms in real-time. These measures are necessary to provide visibility and observability for containerized applications in such dynamic computing environments.
+This project implements a controlled-environment prototype that connects runtime
+alerts to Kubernetes API actions. Its objective is to detach a selected compromised
+pod from normal service, retain it for investigation and allow the workload controller
+to create a replacement. Cilium policies provide the configured network-quarantine
+mechanism. The response is asynchronous; changing a label is not proof that the
+network policy has already been enforced.
 
-While the isolation between containers restricts the impact of an exploited application, several runtime threats can still manifest. Through hands-on exercises, students will gain a deep understanding of runtime security mechanisms, their significance in mitigating security risks, and practical implementation techniques to fortify Kubernetes deployments against emerging threats.
+\section{Architecture}
+The implementation separates event detection, event forwarding, response decisions
+and network enforcement:
+\begin{enumerate}
+\item \textbf{Falco} evaluates syscall events against runtime-security rules.
+\item \textbf{Falcosidekick} receives alerts over HTTP and forwards selected events
+to the response webhook with a shared authentication token.
+\item \textbf{The Python handler} validates event scope and updates the target pod
+through the Kubernetes API, using conflict-aware metadata patches.
+\item \textbf{Kubernetes controllers} reconcile Service membership and replacement
+replicas after the workload selector labels are removed.
+\item \textbf{Cilium} applies explicit ingress and egress deny rules to endpoints
+selected by the quarantine label.
+\end{enumerate}
+The target application, \texttt{vulnapp}, is a minimal Flask network-diagnostic form
+with a deliberate command-injection vulnerability. Its source, container definition,
+deployment manifests and a Linux ptrace demonstration are included in the repository.
 
-From a security perspective, containers are exposed to different attack vectors aiming to breach the security boundary and escape container isolation, potentially performing lateral movements within the system and escalating privileges. This vulnerability is particularly concerning in multi-tenant environments where different users run their workloads on shared hardware.
+\section{Scope and trust boundary}
+The prototype is intended for an isolated, disposable environment. The vulnerable
+application must not be exposed to public or untrusted networks. The handler is
+restricted to the configured namespace and workload label; cluster administrators,
+node access and users who can create pods or modify labels remain trusted.
 
-One of the most widely adopted security tools for container runtime security is \textbf{Falco}, an open-source cloud-native runtime security project. It acts as a security camera detecting unexpected behavior, intrusions, and data theft in real-time. In this lab, students will practice deploying a vulnerable application, monitoring its behavior with Falco, and ultimately simulating an attack to observe how a command injection can lead to a reverse shell. 
+The project is not a production incident-response platform. It does not acquire
+memory, verify exported evidence, implement a durable event queue or guarantee
+continuous service. Two application replicas reduce exposure to a single-pod
+incident but do not establish zero downtime. Network enforcement, controller
+reconciliation and failure recovery must be measured in the deployment environment.
 
-All the exercises will be carried out by using Virtual Machines on CrownLabs, running all the necessary tools for creating the Kubernetes cluster and experimenting with it.
+\section{Implementation and verification status}
+The response handler, deployment hardening, network-policy manifests and automated
+tests are implemented. Sixteen regression tests passed in the Python 3.11 handler
+image under non-root, read-only and network-disabled execution. Both container
+images were built, Helm output was inspected, and standard Kubernetes manifests
+passed server-side dry-run validation.
 
-\vspace{20pt}
-
-\textbf{Beware}: when working with text-only VMs, the \textbf{highly suggested solution} is to use a terminal on the student's local machine, connecting with CrownLabs' VM via SSH (for the proper setup of an SSH key in your CrownLabs account and extensive instructions for this step, refer to the following page \url{https://crownlabs.polito.it/resources/crownlabs_ssh/}).
-If this is not possible, another solution is to use the image ``Client VM'', which has a GUI, and use it to interact with the other CrownLabs' VMs. This solution is \textbf{discouraged} since it uses too many CrownLabs resources and introduces unnecessary latencies and complications during the execution of the lab.
+\textbf{End-to-end Falco-to-Cilium containment remains unverified for this revision.}
+The available validation environment did not include Cilium. Detection scenarios
+in Chapter~\ref{ch:ch3} specify reproducible procedures and acceptance criteria,
+not a claim that the complete chain has already passed those checks.

@@ -1,173 +1,101 @@
-\chapter{Historical CrownLabs setup}
+\chapter{Environment and deployment}
 \label{ch:ch2}
+\section{Requirements and version boundaries}
+The deployment requires a disposable Linux Kubernetes cluster, a compatible Cilium
+installation, Helm and an image build tool. Select and record a supported combination
+of Kubernetes, Cilium, kernel and container runtime. Do not replace an existing
+cluster's network plugin merely to run this project.
 
-The physical setup of this lab consists of a single VM representing our bare-metal infrastructure. This VM will act as an all-in-one Kubernetes \textit{control plane} and \textit{worker node} (Single-Node architecture). This topology is specifically chosen to bypass VXLAN overlay network restrictions present in the CrownLabs environment that drop cross-node pod traffic. The installation process requires the \texttt{kubeadm}, \texttt{kubectl}, and \texttt{kubelet} packages to be installed: the provided CrownLabs image already includes them.
+The committed Falco configuration targets chart \textbf{9.1.0} and Falco
+\textbf{0.44.1}, using the modern-eBPF driver with kernel BTF support. The historical
+kernel-module configuration is not part of this deployment procedure. Falco and
+Cilium have distinct roles: syscall-based detection and network-policy enforcement,
+respectively.
 
-\section{Configuring the Kubernetes cluster}
+Direct Python dependencies and the chart version are specified, but container base
+layers and transitive dependencies are not fully locked. The implementation therefore
+does not claim bit-for-bit reproducibility. Record image digests and ruleset versions
+when collecting integration evidence.
 
-The Kubernetes control plane, including components such as the API server and the controller manager, governs the cluster behavior. Specifically, the control plane maintains a record of all the Kubernetes objects in the system and runs continuous control loops to manage those objects' state. 
+All commands below assume the repository root as the working directory. The image
+import example applies to a single-node containerd environment; other runtimes need
+their corresponding image-loading mechanism.
 
-\subsection{Configuring the control plane node}
-
-First, select a VM that is supposed to act as the control plane node and change the name of the machine to clarify its function in the Kubernetes cluster:
-
+\section{Building and deploying the target}
 \begin{lstlisting}[language=bash]
-sudo hostnamectl set-hostname control-plane-1
+kubectl config current-context
+docker build -t vulnapp:lab-v2 material/vulnapp
+docker build -t falco-handler:lab-v2 material/falco_handler/src
+docker save vulnapp:lab-v2 falco-handler:lab-v2 | \
+  sudo ctr -n k8s.io images import -
+# Establish quarantine policy before enabling automatic response.
+kubectl apply -f material/manifests/isolate-tainted-policy.yaml
+kubectl apply -f material/manifests/vulnapp-deployment.yaml
+kubectl apply -f material/manifests/vulnapp-service.yaml
+kubectl apply -f material/manifests/vulnapp-pdb.yaml
+kubectl -n default rollout status deployment/vulnapp
 \end{lstlisting}
+The target has two replicas and a readiness probe. A NodePort Service on port 32080
+selects pods labelled \texttt{app=vulnapp}. The ServiceAccount token is deliberately
+mounted for the credential-exposure scenario. This choice must not be copied into
+an application that does not require Kubernetes API access.
 
-\textbf{Warning}: you have to disconnect from the VM and open another SSH session to update the prompt. Then, from the same node, it is possible to leverage \texttt{kubeadm} to initialize the control-plane:
-
+\section{Deploying the authenticated handler}
+Generate one shared token and keep it available in the same shell until Falco has
+been configured. Never commit a real token to the repository.
 \begin{lstlisting}[language=bash]
-sudo kubeadm init --pod-network-cidr=10.254.0.0/16 --service-cidr=10.255.0.0/16
+export FALCO_WEBHOOK_TOKEN="$(openssl rand -hex 32)"
+kubectl -n default create secret generic falco-handler-auth \
+  --from-literal=webhook-token="$FALCO_WEBHOOK_TOKEN" \
+  --dry-run=client -o yaml | kubectl apply -f -
+kubectl apply -f material/falco_handler/falco-handler-rbac.yaml
+kubectl apply -f material/falco_handler/falco-handler-service.yaml
+kubectl apply -f material/falco_handler/falco-handler-networkpolicy.yaml
+kubectl apply -f material/falco_handler/falco-handler-deployment.yaml
+kubectl -n default rollout restart deployment/falco-handler
+kubectl -n default rollout status deployment/falco-handler
 \end{lstlisting}
+The restart also refreshes Secret-backed environment variables when rotating the
+token on an existing installation. The handler Service uses port 80, forwarding to
+container port 5000. Its ingress policy selects only Falcosidekick pods in the
+\texttt{falco} namespace. The namespaced Role grants pod get/list/patch/delete;
+workload filtering is enforced by the handler, not by label-scoped RBAC.
 
-\texttt{kubeadm init} first runs a series of pre-flight checks to ensure that the machine is ready to run Kubernetes, then downloads and installs the cluster control plane components. This may take several minutes. As part of the installation process, the previous command will print on screen a join string. \textbf{You can ignore this join string}, as we will not be adding any worker nodes to this cluster.
-
-Once the configuration is completed, it is possible to make \texttt{kubectl} work for the current user:
-
+\section{Configuring the event pipeline}
+Create the Falco namespace and restrict the upstream receiver before installing
+Falcosidekick. The committed values use pod networking; verify the rendered labels
+and network behaviour in the selected environment.
 \begin{lstlisting}[language=bash]
-mkdir -p $HOME/.kube
-sudo cp /etc/kubernetes/admin.conf $HOME/.kube/config
-sudo chown $(id -u):$(id -g) $HOME/.kube/config
-\end{lstlisting}
-
-Kubernetes does not embed the logic to interconnect different pods. Instead, it leverages a modular architecture based on the Container Network Interface (CNI). In this lab, we select \textbf{Cilium}, an open-source solution which provides highly scalable networking and security capabilities based on eBPF (Extended Berkeley Packet Filter).
-
-\begin{tcolorbox}[colback=blue!5!white,colframe=blue!75!black,title=Why Cilium and Falco together?]
-Both Cilium and Falco exploit the power of \textbf{eBPF}, a revolutionary Linux kernel technology that allows safe, sandboxed programs to run inside the OS kernel without modifying its source code or loading kernel modules. However, the two tools operate at complementary layers of the security stack:
-\begin{itemize}
-    \item \textbf{Cilium} leverages eBPF for \textit{network security}: it enforces Network Policies at layers L3/L4/L7, provides load balancing, and secures east-west traffic between pods. Without a CNI like Cilium, pods cannot communicate at all.
-    \item \textbf{Falco} leverages eBPF for \textit{runtime security}: it intercepts Linux system calls made by containerized processes directly from the kernel, detecting anomalous behaviors such as spawning shells, reading sensitive files, or opening unexpected network connections.
-\end{itemize}
-Together, they represent two fundamental and complementary pillars of cloud-native security: Cilium controls \textit{what can be reached}, while Falco detects \textit{what is happening at runtime}.
-\end{tcolorbox}
-
-Before installing Cilium, verify that the control plane node is initialized (it will be in the \texttt{NotReady} state because the network plugin is not yet installed):
-
-\begin{lstlisting}[language=bash]
-kubectl get nodes
-\end{lstlisting}
-
-Since we are deploying a single-node cluster, we must remove the default taint on the control plane node so that standard application pods (like our \texttt{vulnapp}) can be scheduled on it. Run the following commands:
-
-\begin{lstlisting}[language=bash]
-kubectl taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule-
-kubectl taint nodes --all node-role.kubernetes.io/master:NoSchedule-
-\end{lstlisting}
-
-Cilium can be installed through the provided CLI:
-
-\begin{lstlisting}[language=bash]
-curl -L --fail --remote-name-all \
-  https://github.com/cilium/cilium-cli/releases/latest/download/cilium-linux-amd64.tar.gz
-sudo tar -xzvf cilium-linux-amd64.tar.gz -C /usr/local/bin
-rm cilium-linux-amd64.tar.gz
-cilium install --version 1.15.14
-\end{lstlisting}
-
-Once Cilium is installed, wait for it to report that the cluster is healthy:
-
-\begin{lstlisting}[language=bash]
-cilium status --wait
-\end{lstlisting}
-
-\section{Deploying the vulnerable application}
-
-Now that you have a fully working Kubernetes cluster, we can proceed to deploy the environment required for the security monitoring activities.
-
-We will use \texttt{vulnapp}: a minimal Python web application that simulates a network diagnostic tool. It exposes a form where the user enters a hostname or IP address and the server executes a \texttt{ping} against it. The application is intentionally vulnerable to \textbf{Command Injection} due to the use of unsanitized user input in a shell command --- a deliberate design choice to simulate one of the most common classes of real-world web vulnerabilities (OWASP Top~10 A03: Injection). You will explore this vulnerability in depth in Chapter~\ref{ch:ch3}.
-
-The original teaching distribution used a ZIP archive. In the public repository,
-use the checked-out \texttt{material/} directory instead; no \texttt{material.zip}
-is distributed. The paths below describe the historical VM layout, not an additional
-archive to download:
-
-\begin{lstlisting}[language=bash]
-# Use the material/ directory from the repository checkout.
-\end{lstlisting}
-
-The \texttt{vulnapp} Docker image must be built locally on the \textbf{control plane node}, where it will be scheduled to run. Navigate to the folder and build the image:
-
-\begin{lstlisting}[language=bash]
-cd $HOME/material/vulnapp
-docker build -t vulnapp:latest .
-docker save vulnapp:latest | sudo ctr -n k8s.io images import -
-\end{lstlisting}
-
-\begin{tcolorbox}[colback=blue!5!white,colframe=blue!75!black,title=Info]
-Since \texttt{kubeadm} uses \texttt{containerd} as the runtime, images built with \texttt{docker} are not immediately visible to Kubernetes. We must explicitly import the image into the \texttt{k8s.io} namespace using \texttt{ctr}. Alternatively, you can use \texttt{sudo nerdctl -n k8s.io build -t vulnapp:latest .} to build directly into the correct namespace.
-\end{tcolorbox}
-
-Return to the control plane node and deploy the application in the \texttt{default} namespace:
-
-\begin{lstlisting}[language=bash]
-kubectl apply -f $HOME/material/manifests/vulnapp-deployment.yaml
-kubectl apply -f $HOME/material/manifests/vulnapp-service.yaml
-kubectl apply -f $HOME/material/manifests/vulnapp-pdb.yaml
-\end{lstlisting}
-
-Verify that the application is running:
-
-\begin{lstlisting}[language=bash]
-kubectl get pods
-\end{lstlisting}
-
-The output should show both \texttt{vulnapp} replicas in the \texttt{Running} state.
-The second replica reduces disruption during a single incident but does not guarantee
-continuous availability. The following is illustrative output:
-\begin{lstlisting}[language=bash]
-NAME                       READY   STATUS    RESTARTS   AGE
-vulnapp-7c4d9f8b4-xk2mp   1/1     Running   0          45s
-vulnapp-7c4d9f8b4-zt5q8   1/1     Running   0          43s
-\end{lstlisting}
-
-
-\section{Installing Falco via Helm}
-
-Falco is a CNCF graduated project for runtime security. It parses Linux system calls from the kernel at runtime, and asserts the stream against a powerful rules engine. 
-
-To install Falco in our Kubernetes cluster, we will use Helm. If Helm is not already installed on your control plane node, you can easily install it by running:
-
-\begin{lstlisting}[language=bash]
-curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
-chmod 700 get_helm.sh
-./get_helm.sh
-rm get_helm.sh
-\end{lstlisting}
-
-Add the Falco repository to Helm:
-
-\begin{lstlisting}[language=bash]
+kubectl create namespace falco --dry-run=client -o yaml | kubectl apply -f -
+kubectl apply -f material/falco/falcosidekick-networkpolicy.yaml
 helm repo add falcosecurity https://falcosecurity.github.io/charts
 helm repo update
+(
+  umask 077
+  FALCO_VALUES_DIR=$(mktemp -d)
+  trap 'rm -f "$FALCO_VALUES_DIR/values.yaml"; rmdir "$FALCO_VALUES_DIR"' EXIT
+  cp material/falco/falco-values.example.yaml "$FALCO_VALUES_DIR/values.yaml"
+  perl -pi -e 's/CHANGE_ME/$ENV{FALCO_WEBHOOK_TOKEN}/g' \
+    "$FALCO_VALUES_DIR/values.yaml"
+  helm upgrade --install falco falcosecurity/falco --version 9.1.0 \
+    --reset-values -n falco -f "$FALCO_VALUES_DIR/values.yaml" --wait
+)
+unset FALCO_WEBHOOK_TOKEN
 \end{lstlisting}
+Review intentional local overrides before using \texttt{--reset-values}. Reusing
+old values can retain duplicate custom-rule definitions. Helm release metadata can
+contain supplied configuration secrets, so access to those objects must be restricted.
+The shared token authenticates a request; unencrypted HTTP does not provide transport
+confidentiality. Production deployment would require stronger transport and secret controls.
 
-Now install Falco in a dedicated namespace (\texttt{falco}). While eBPF is the modern standard for Falco, we will use the legacy Kernel Module (\texttt{kmod}) driver in this lab. This is a deliberate architectural choice: the kernel provided by the CrownLabs VM environment lacks full BTF (BPF Type Format) support, which is required for modern eBPF probes to function reliably. The \texttt{kmod} driver guarantees compatibility in this specific environment, though it requires the kernel headers to be installed to compile the probe at runtime. Before proceeding, make sure to run the following:
+\section{Migration and operational checks}
+An existing ClusterRoleBinding is not removed by applying a RoleBinding. Inspect
+obsolete global bindings and their consumers before deleting any of them. Confirm
+that the handler cannot patch pods outside the intended namespace. The repository
+README lists the legacy object names and current deployment commands.
 
-\begin{lstlisting}[language=bash]
-sudo apt-get update
-sudo apt-get install -y linux-headers-$(uname -r)
-\end{lstlisting}
-
-Then, install Falco:
-
-\begin{lstlisting}[language=bash]
-helm install falco falcosecurity/falco \
-  --namespace falco \
-  --create-namespace \
-  --set tty=true \
-  --set driver.kind=kmod
-\end{lstlisting}
-
-Wait a few seconds, then verify that the Falco daemonset has been successfully deployed and the pods are running:
-
-\begin{lstlisting}[language=bash]
-kubectl get pods -n falco
-\end{lstlisting}
-
-\begin{lstlisting}[language=bash]
-NAME          READY   STATUS    RESTARTS   AGE
-falco-4dgzk   2/2     Running   0          39s
-\end{lstlisting}
-
-Falco is now silently monitoring all the system calls in our cluster!
+Before enabling response, check both directions of the event path: Falco must reach
+Falcosidekick and Falcosidekick must reach the handler, while unrelated pods must not.
+NetworkPolicies are additive, so inspect other policies and administrator/node access.
+For detection-only observations, deploy Falco without enabling the response handler;
+otherwise an accepted event can interrupt the scenario by quarantining the target.

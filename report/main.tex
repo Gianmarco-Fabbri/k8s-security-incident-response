@@ -1,70 +1,38 @@
 \PassOptionsToPackage{hyphens}{url}
 \documentclass[exercise]{other/netgroup_didattica}
-% Include most common packages and macros that are needed in all files
+% Preserve the template's OT1 body font; T1 is needed only for code quotes.
+\usepackage[T1,OT1]{fontenc}
 \input{other/netgroup-common-packages.tex}
-% Include the packages and macros that are required to include code listings
 \input{other/netgroup-code-listings.tex}
-
-% Set the listings style to be used globally
-\lstset{style=bash}
-
-\def\thetitle{Kubernetes Runtime Security Monitoring}
-\def\theauthor{\parbox{\linewidth}{\centering Gianmarco Fabbri}}
-
-\title{\thetitle}
-\course{\parbox{\linewidth}{\centering Networks \& Cloud Technologies and Security \\ Network and Cloud Security}}
-\author{\theauthor}
+\lstset{style=bash,basicstyle=\fontencoding{T1}\ttfamily\footnotesize}
+\title{Kubernetes Runtime Security and Incident Response}
+\course{Technical Project Report}
+\author{\parbox{\linewidth}{\centering Gianmarco Fabbri}}
 \logo{images/logo.jpg}
-
-% Customize the metadata inside the output PDF file
-\hypersetup{
-    pdftitle={\thetitle},
-    %pdfauthor={\theauthor},
-}
-
-% Create index
-\makeindex
-
+\hypersetup{pdftitle={Kubernetes Runtime Security and Incident Response},
+pdfauthor={Gianmarco Fabbri},
+pdfsubject={Technical project report: architecture, deployment and validation}}
 \begin{document}
-
 \maketitle
+\clearpage
+\section*{Project origin and attribution}
+This project was originally designed and developed by Gianmarco Fabbri during
+his M.Sc. studies in Cybersecurity Engineering at Politecnico di Torino, and was
+subsequently extended with additional response controls and automated tests.
+It builds on existing runtime-security teaching material; the current implementation
+and the original material should not be treated as the same contribution.
 
-\pagebreak
-
-% Standard license for Netgroup exercises
+The author acknowledges Francesco Pizzato, who created the original laboratory
+material, and Alex Palesandro, Marco Iorio and Stefano Galantino for their
+enhancements to that material. These credits are retained independently of the
+technical presentation of this report.
 \input{other/netgroup-license.tex}
-
-\section*{Acknowledgments}
-The author would like to thank all the people who contributed to this document, particularly Francesco Pizzato, who created the first version of this lab, and Alex Palesandro, Marco Iorio, and Stefano Galantino for their valuable enhancements and subsequent improvements.
-
 \clearpage
-
-\setcounter{tocdepth}{1} 
+\setcounter{tocdepth}{1}
 \tableofcontents
-\pagebreak
-
-\section*{Revision status and reproducibility}
-This handbook builds on the university lab presented on 9 September 2026, before
-the afternoon repository changes (Git reference \texttt{9ec6471}). The original
-teaching material and its acknowledgments remain attributed to their authors.
-The current repository extends that lab; it is not the original submitted version.
-
-The CrownLabs setup in Chapter 2 documents the historical environment. For the
-current operational procedure, use the repository README, including its validation
-section: it specifies the chart version, authentication,
-network policies and migration checks. Do not combine the historical kernel-module
-installation with the current modern-eBPF configuration. Examples in this handbook
-are illustrative, not measurements of the current revision. Live Cilium enforcement
-has not been validated in the available OrbStack environment.
 \clearpage
-
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 \subfile{src/ch1}
 \subfile{src/ch2}
 \subfile{src/ch3}
 \subfile{src/ch4}
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-
-
-% ------------------------------------------------------- %
 \end{document}
