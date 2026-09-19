@@ -2,8 +2,14 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: vulnapp
+  namespace: default
 spec:
-  replicas: 1
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       app: vulnapp
@@ -12,9 +18,27 @@ spec:
       labels:
         app: vulnapp
     spec:
+      # Deliberately enabled for the token-theft exercise. Never copy this
+      # setting to an application that does not need Kubernetes API access.
+      automountServiceAccountToken: true
       containers:
-      - name: vulnapp
-        image: vulnapp:latest
-        imagePullPolicy: IfNotPresent
-        ports:
-        - containerPort: 8080
+        - name: vulnapp
+          image: vulnapp:lab-v2
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          # No liveness restart: an isolated pod may contain volatile evidence.
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "250m"
+              memory: "256Mi"

@@ -2,10 +2,13 @@ apiVersion: v1
 kind: Service
 metadata:
   name: falco-handler
+  namespace: default
 spec:
+  type: ClusterIP
   selector:
     app: falco-handler
   ports:
-    - protocol: TCP
+    - name: http
+      protocol: TCP
       port: 80
-      targetPort: 5000
+      targetPort: http

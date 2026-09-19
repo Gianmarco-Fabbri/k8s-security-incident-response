@@ -1,5 +1,5 @@
 /*
- * ptrace_anti_debug.c
+ * ptrace.c
  *
  * Demonstrates the ptrace(PTRACE_TRACEME) anti-debugging technique.
  * A process that calls PTRACE_TRACEME signals to the OS that it is
@@ -11,7 +11,7 @@
  * MITRE ATT&CK: T1622 - Debugger Evasion
  *
  * Compile with:
- *   gcc -o ptrace ptrace_anti_debug.c
+ *   gcc -o ptrace ptrace.c
  *
  * For educational purposes only.
  */

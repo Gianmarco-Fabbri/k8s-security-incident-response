@@ -2,10 +2,13 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: falco-handler
+  namespace: default
   labels:
     app: falco-handler
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: falco-handler
@@ -15,12 +18,51 @@ spec:
         app: falco-handler
     spec:
       serviceAccountName: falco-handler
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: falco-handler
-          image: falco-handler:latest
+          image: falco-handler:lab-v2
           imagePullPolicy: IfNotPresent
+          env:
+            - name: WEBHOOK_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: falco-handler-auth
+                  key: webhook-token
+            - name: ALLOWED_RULES
+              value: "Redirect STDOUT/STDIN to Network Connection in Container,PTRACE anti-debug attempt,Detect Network Tools in vulnapp"
+            - name: ALLOWED_NAMESPACES
+              value: "default"
+            - name: TARGET_LABEL_KEY
+              value: "app"
+            - name: TARGET_LABEL_VALUE
+              value: "vulnapp"
+            - name: DETACH_LABEL_KEYS
+              value: "app,pod-template-hash"
+            - name: MAX_QUARANTINED_PODS
+              value: "3"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           ports:
-            - containerPort: 5000
+            - name: http
+              containerPort: 5000
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           resources:
             requests:
               cpu: "100m"
@@ -31,12 +73,20 @@ spec:
           livenessProbe:
             httpGet:
               path: /health
-              port: 5000
+              port: http
             initialDelaySeconds: 5
             periodSeconds: 10
+            timeoutSeconds: 5
           readinessProbe:
             httpGet:
-              path: /health
-              port: 5000
+              path: /ready
+              port: http
             initialDelaySeconds: 2
             periodSeconds: 5
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

@@ -2,9 +2,12 @@ apiVersion: "cilium.io/v2"
 kind: CiliumNetworkPolicy
 metadata:
   name: isolate-tainted-pods
+  namespace: default
 spec:
   endpointSelector:
     matchLabels:
       tainted-by-falco: "true"
-  ingress: []
-  egress: []
+  ingressDeny:
+    - fromEntities: [all]
+  egressDeny:
+    - toEntities: [all]

@@ -1,20 +1,18 @@
 FROM python:3.11-slim
 
-# Create a non-root user
-RUN useradd -m -s /bin/bash appuser
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN groupadd --gid 10001 app && \
+    useradd --uid 10001 --gid app --create-home --shell /usr/sbin/nologin app
 
 WORKDIR /app
 
-COPY handler.py .
+COPY requirements.txt .
+RUN pip install --no-cache-dir --disable-pip-version-check -r requirements.txt
 
-# Install dependencies without curl
-RUN apt-get update && \
-    pip install --no-cache-dir flask kubernetes gunicorn && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
+COPY --chown=10001:10001 handler.py .
 
-# Switch to non-root user
-USER appuser
+USER 10001:10001
 
-# Run with Gunicorn instead of Flask's built-in server
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--access-logfile", "-", "--error-logfile", "-", "handler:app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--threads", "4", "--timeout", "60", "--worker-tmp-dir", "/tmp", "--access-logfile", "-", "--error-logfile", "-", "handler:create_app()"]
