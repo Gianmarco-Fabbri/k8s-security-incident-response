@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: material/falco_handler/src/requirements.txt
+      - name: Install dependencies
+        run: pip install -r material/falco_handler/src/requirements.txt
+      - name: Compile Python sources
+        run: python -m compileall -q material/falco_handler/src material/vulnapp
+      - name: Run handler tests
+        env:
+          PYTHONPATH: material/falco_handler/src
+        run: python -m unittest discover -s material/falco_handler/tests -v
+      - name: Parse Kubernetes manifests
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import yaml
+
+          for path in Path("material").rglob("*.yaml"):
+              list(yaml.safe_load_all(path.read_text()))
+              print(f"OK {path}")
+          PY
+      - name: Build and test hardened handler image
+        run: |
+          docker build -t falco-handler:ci material/falco_handler/src
+          docker run --rm --network none --read-only --tmpfs /tmp --cap-drop ALL \
+            --security-opt no-new-privileges \
+            -v "$PWD/material/falco_handler/tests:/tests:ro" \
+            -e PYTHONPATH=/app falco-handler:ci python -m unittest discover -s /tests -v
+      - name: Build lab target image
+        run: docker build -t vulnapp:ci material/vulnapp
